@@ -62,7 +62,9 @@ export abstract class BaseScraper {
   }
 
   async initialize(): Promise<void> {
-    await this.browserManager.launch({ headless: true });
+    const headless = process.env.HEADLESS !== 'false';
+    this.logger.debug(`Launching browser (headless: ${headless})`);
+    await this.browserManager.launch({ headless });
     await this.browserManager.createContext();
     this.page = await this.browserManager.createPage();
   }

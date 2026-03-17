@@ -5,6 +5,46 @@ All notable changes to the Tax Data Extraction CLI project will be documented in
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-03-17
+
+### Changed
+
+#### Booking.com Scraper — Complete Rewrite (`src/scrapers/booking.ts`)
+- Retargeted to `https://admin.booking.com` (Booking.com Extranet) instead of `partner.booking.com`
+- Implemented two-step login flow (username field first, then password reveal) matching the real admin portal
+- Replaced placeholder `data-testid` selectors with multi-selector fallback strategy (tries several candidates, logs which matched)
+- Added automatic hotel ID detection from URL params, URL path, inline scripts, and `data-` attributes
+- Added `BOOKING_HOTEL_ID` env override for manual hotel ID specification (supports comma-separated multiple IDs)
+- Added screenshot capture at every major step → saved to `output/debug/*.png`
+- Added full page HTML dump at every navigation step → saved to `output/debug/*.html` (key for selector discovery)
+- Improved `parseAmount()` to handle European number format (1.234,56 → 1234.56)
+- Improved `calculateNights()` to return minimum 1 night instead of 0
+
+#### Browser Manager (`src/utils/browser.ts`)
+- Added 50ms `slowMo` automatically in headed mode so interactions are visible
+
+#### Base Scraper (`src/scrapers/base.ts`)
+- `initialize()` now reads `HEADLESS` env var — set `HEADLESS=false` to run with visible browser window
+
+#### CLI Entry Point (`src/index.ts`)
+- Fixed crash: replaced `.parseSync()` with `.parseAsync()` (required for async command handlers)
+
+#### TypeScript Config (`tsconfig.json`)
+- Fixed invalid `module: "ES2024"` → `"NodeNext"` and `moduleResolution: "NodeNext"`
+- Added `"DOM"` to `lib` array so `document`, `window`, `Element` types resolve inside `page.evaluate()` callbacks
+- Downgraded `target` to `"ES2022"` (supported value)
+
+#### Environment Config (`.env.example`)
+- Added `BOOKING_HOTEL_ID` — set to your Booking.com hotel/property ID if auto-detection fails
+- Added `HEADLESS=false` — default for development; change to `true` for unattended runs
+- Added `DEVTOOLS=false` — reserved for future DevTools auto-open support
+
+#### Dev Dependencies
+- Added `@types/yargs` to fix implicit `any` type errors on yargs callbacks
+- Fixed `jest.config.js` preset from `ts-jest/esm` (not found) to `ts-jest`
+- Added ts-jest `diagnostics.ignoreCodes: [151002]` to suppress NodeNext hybrid module warning
+
+
 ## [1.0.0] - 2026-03-17
 
 ### Added

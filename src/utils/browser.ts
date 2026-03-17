@@ -18,7 +18,8 @@ export class BrowserManager {
 
   async launch(options: BrowserOptions = {}): Promise<Browser> {
     const headless = options.headless !== false;
-    const slowMo = options.slowMo || 0;
+    // Add a small slowMo in headed mode so interactions are visible
+    const slowMo = options.slowMo ?? (headless ? 0 : 50);
 
     this.browser = await chromium.launch({
       headless,

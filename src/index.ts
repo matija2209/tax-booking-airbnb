@@ -134,6 +134,4 @@ const argv = yargs(hideBin(process.argv))
   .alias('help', 'h')
   .demandCommand(1, 'You must specify a command: airbnb or booking')
   .strict()
-  .parseSync();
-
-export default argv;
+  .parseAsync();

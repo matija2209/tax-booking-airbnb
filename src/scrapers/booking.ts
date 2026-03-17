@@ -1,37 +1,51 @@
+import { mkdir, writeFile } from 'fs/promises';
+import { join } from 'path';
 import { BaseScraper } from './base.js';
 import { Reservation, Payout, ExtractionResult, ExtractionOptions } from '../types/index.js';
 import { calculateAggregates } from '../extractors/aggregates.js';
 import { formatDate } from '../utils/dates.js';
 
+const ADMIN_URL = 'https://admin.booking.com';
+
 export class BookingScraper extends BaseScraper {
+  private debugDir = 'output/debug';
+
   async extract(options: ExtractionOptions): Promise<ExtractionResult> {
+    this.debugDir = join(options.output || 'output', 'debug');
+
     try {
       await this.initialize();
-
       this.logger.info('Starting Booking.com data extraction...');
+
       await this.loginToBooking();
 
-      const properties = await this.getProperties();
-      this.logger.info(`Found ${properties.length} properties`);
+      const hotelIds = await this.detectHotelIds();
+      this.logger.info(`Detected hotel IDs: ${hotelIds.join(', ') || 'none'}`);
 
-      const propertiesToScrape = options.propertyId
-        ? properties.filter((p) => p.id === options.propertyId)
-        : properties;
+      if (hotelIds.length === 0) {
+        throw new Error(
+          'No hotel IDs detected after login. Set BOOKING_HOTEL_ID in your .env file.'
+        );
+      }
 
-      if (propertiesToScrape.length === 0) {
+      const idsToScrape = options.propertyId
+        ? hotelIds.filter((id) => id === options.propertyId)
+        : hotelIds;
+
+      if (idsToScrape.length === 0) {
         throw new Error(`No properties found matching ID: ${options.propertyId}`);
       }
 
       const allReservations: Reservation[] = [];
       const allPayouts: Payout[] = [];
 
-      for (const property of propertiesToScrape) {
-        this.logger.info(`Extracting data for property: ${property.name} (${property.id})`);
+      for (const hotelId of idsToScrape) {
+        this.logger.info(`Extracting data for hotel ID: ${hotelId}`);
 
-        const reservations = await this.getReservations(property.id, property.name, options);
+        const reservations = await this.getReservations(hotelId, options);
         allReservations.push(...reservations);
 
-        const payouts = await this.getPayouts(options);
+        const payouts = await this.getPayouts(hotelId, options);
         allPayouts.push(...payouts);
       }
 
@@ -48,216 +62,446 @@ export class BookingScraper extends BaseScraper {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Login
+  // ---------------------------------------------------------------------------
+
   private async loginToBooking(): Promise<void> {
-    if (!this.page) {
-      throw new Error('Page not initialized');
+    if (!this.page) throw new Error('Page not initialized');
+
+    this.logger.info(`Navigating to ${ADMIN_URL} ...`);
+    await this.page.goto(ADMIN_URL, { waitUntil: 'domcontentloaded' });
+    await this.screenshot('01-login-page');
+
+    // Booking.com extranet login form uses name="loginname" for the username field
+    const loginSelectors = [
+      'input[name="loginname"]',
+      'input[name="username"]',
+      'input[name="email"]',
+      'input[type="email"]',
+    ];
+
+    const loginSelector = await this.firstVisibleSelector(loginSelectors, 15000);
+    if (!loginSelector) {
+      await this.screenshot('01-login-no-field');
+      await this.savePageHtml('01-login-page');
+      throw new Error(
+        'Could not find login name field. Check 01-login-page.html in debug output.'
+      );
     }
 
-    const loginUrl = 'https://partner.booking.com/en-gb/login';
-    const emailSelector = 'input[type="email"]';
-    const passwordSelector = 'input[type="password"]';
-    const submitSelector = 'button[type="submit"]';
+    await this.page.fill(loginSelector, this.credentials.email);
+    this.logger.debug(`Filled login name using selector: ${loginSelector}`);
 
+    // Booking.com may show password on the same page or require a "Continue" click first
+    const passwordSelector = 'input[name="password"], input[type="password"]';
+    const passwordVisible = await this.page.isVisible(passwordSelector);
+
+    if (!passwordVisible) {
+      this.logger.debug('Password field not visible yet — clicking submit to reveal it...');
+      await this.page.click('button[type="submit"], input[type="submit"]');
+      try {
+        await this.page.waitForSelector(passwordSelector, { timeout: 10000 });
+        await this.screenshot('02-password-step');
+      } catch {
+        await this.screenshot('02-no-password-field');
+        await this.savePageHtml('02-after-username-submit');
+        throw new Error(
+          'Password field did not appear after username submit. Check debug output.'
+        );
+      }
+    }
+
+    await this.page.fill(passwordSelector, this.credentials.password);
+    await this.screenshot('03-before-submit');
+    this.logger.debug('Filled password, submitting...');
+
+    await this.page.click('button[type="submit"], input[type="submit"]');
+
+    // Wait for successful login: URL should change away from login/signin paths
     try {
-      await this.login(loginUrl, emailSelector, passwordSelector, submitSelector);
-    } catch (error) {
-      this.logger.error('Failed to login to Booking.com:', error);
-      throw error;
+      await this.page.waitForFunction(
+        "!window.location.href.includes('/login') && " +
+          "!window.location.href.includes('/signin') && " +
+          "!window.location.href.includes('login.en-gb')",
+        { timeout: 30000 }
+      );
+      this.logger.info('Login successful');
+    } catch {
+      await this.screenshot('04-login-failed');
+      await this.savePageHtml('04-login-result');
+      const currentUrl = this.page.url();
+      throw new Error(
+        `Login may have failed — still on login page. Current URL: ${currentUrl}` +
+          `\nCheck credentials in .env and see debug output for details.`
+      );
     }
+
+    await this.screenshot('05-after-login');
+    await this.savePageHtml('05-after-login');
+    this.logger.debug(`Post-login URL: ${this.page.url()}`);
   }
 
-  private async getProperties(): Promise<Array<{ id: string; name: string }>> {
-    if (!this.page) {
-      throw new Error('Page not initialized');
+  // ---------------------------------------------------------------------------
+  // Hotel ID detection
+  // ---------------------------------------------------------------------------
+
+  private async detectHotelIds(): Promise<string[]> {
+    if (!this.page) throw new Error('Page not initialized');
+
+    // Honour an explicit env override first
+    const envId = process.env.BOOKING_HOTEL_ID;
+    if (envId) {
+      this.logger.info(`Using BOOKING_HOTEL_ID from .env: ${envId}`);
+      return envId.split(',').map((s) => s.trim()).filter(Boolean);
     }
 
-    this.logger.info('Fetching properties...');
+    const url = this.page.url();
+    this.logger.debug(`Post-login URL: ${url}`);
+
+    // hotel_id= query param
+    try {
+      const urlObj = new URL(url);
+      const param = urlObj.searchParams.get('hotel_id');
+      if (param) return [param];
+    } catch {/* invalid url */}
+
+    // /hotel/12345/ path segment
+    const pathMatch = url.match(/\/hotel\/(\d+)\//);
+    if (pathMatch) return [pathMatch[1]];
+
+    // Search the page source for hotel_id occurrences
+    const found = await this.page.evaluate(() => {
+      const ids: string[] = [];
+      // Check inline scripts
+      document.querySelectorAll('script').forEach((s) => {
+        const matches = [...(s.textContent?.matchAll(/hotel_id['":\s]+(\d{4,})/g) ?? [])];
+        matches.forEach((m) => ids.push(m[1]));
+      });
+      // Check data attributes
+      document.querySelectorAll('[data-hotel-id],[data-property-id],[data-hotel]').forEach((el) => {
+        const id =
+          el.getAttribute('data-hotel-id') ||
+          el.getAttribute('data-property-id') ||
+          el.getAttribute('data-hotel');
+        if (id) ids.push(id);
+      });
+      return [...new Set(ids)];
+    });
+
+    if (found.length > 0) {
+      this.logger.info(`Detected hotel IDs from page: ${found.join(', ')}`);
+      return found;
+    }
+
+    this.logger.warn(
+      'Could not auto-detect hotel ID from URL or page source. ' +
+        'Add BOOKING_HOTEL_ID=<your_id> to your .env file.'
+    );
+    await this.screenshot('hotel-id-detection-failed');
+    await this.savePageHtml('hotel-id-detection-failed');
+    return [];
+  }
+
+  // ---------------------------------------------------------------------------
+  // Reservations
+  // ---------------------------------------------------------------------------
+
+  private async getReservations(
+    hotelId: string,
+    options: ExtractionOptions
+  ): Promise<Reservation[]> {
+    if (!this.page) throw new Error('Page not initialized');
+
+    this.logger.info(`Fetching reservations for hotel ${hotelId}...`);
+
+    const params = new URLSearchParams({ hotel_id: hotelId });
+    if (options.startDate) params.set('date_from', options.startDate);
+    if (options.endDate) params.set('date_to', options.endDate);
+
+    const url = `${ADMIN_URL}/hotel/hoteladmin/reservation.en-gb.html?${params}`;
 
     try {
-      await this.navigateTo('https://partner.booking.com/en-gb/properties');
+      await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+      // Give SPA a moment to hydrate
+      await this.page.waitForLoadState('networkidle').catch(() => {});
+      await this.screenshot(`reservations-${hotelId}`);
+      await this.savePageHtml(`reservations-${hotelId}`);
 
-      // Wait for property listings to load
-      await this.page.waitForSelector('[data-testid="property-item"]', { timeout: 10000 });
+      // Try several plausible row selectors — update once you inspect the real page
+      const rowSelectors = [
+        '[data-testid="reservation-row"]',
+        'tr[data-id]',
+        'tr.reservation-row',
+        '.bui-table__row[class*="reservation"]',
+        'table tbody tr',
+      ];
 
-      const properties = await this.page.evaluate(() => {
-        const items = document.querySelectorAll('[data-testid="property-item"]');
-        return Array.from(items).map((item) => {
-          const link = item.querySelector('a');
-          const nameElement = item.querySelector('[data-testid="property-name"]');
+      const rowSelector = await this.firstPresentSelector(rowSelectors);
+      if (!rowSelector) {
+        this.logger.warn(
+          `No reservation rows found on ${url}. ` +
+            `Inspect reservations-${hotelId}.html in ${this.debugDir} to find the correct selector.`
+        );
+        return [];
+      }
 
-          return {
-            id: link?.getAttribute('href')?.split('/').pop() || '',
-            name: nameElement?.textContent || 'Unknown',
-          };
-        });
-      });
-
-      return properties;
+      this.logger.debug(`Reservation rows matched by: "${rowSelector}"`);
+      return await this.parseReservationRows(rowSelector, hotelId, options);
     } catch (error) {
-      this.logger.warn('Could not automatically fetch properties');
+      this.logger.warn(`Could not fetch reservations for hotel ${hotelId}: ${error}`);
+      await this.screenshot(`reservations-${hotelId}-error`);
       return [];
     }
   }
 
-  private async getReservations(
-    propertyId: string,
-    propertyName: string,
+  private async parseReservationRows(
+    selector: string,
+    hotelId: string,
     options: ExtractionOptions
   ): Promise<Reservation[]> {
-    if (!this.page) {
-      throw new Error('Page not initialized');
-    }
+    if (!this.page) return [];
+
+    const rows = this.page.locator(selector);
+    const count = await rows.count();
+    this.logger.info(`Parsing ${count} reservation rows`);
 
     const reservations: Reservation[] = [];
-    this.logger.info(`Fetching reservations for property ${propertyId}...`);
 
-    try {
-      await this.navigateTo(`https://partner.booking.com/en-gb/property/${propertyId}/reservations`);
-      await this.page.waitForSelector('[data-testid="reservation-item"]', { timeout: 10000 });
+    for (let i = 0; i < count; i++) {
+      try {
+        const row = rows.nth(i);
 
-      const items = await this.page.$$('[data-testid="reservation-item"]');
-      this.logger.debug(`Found ${items.length} reservation items`);
+        const data = await row.evaluate((el: Element) => {
+          const text = (sel: string) =>
+            el.querySelector(sel)?.textContent?.trim() ?? '';
+          const attr = (sel: string, a: string) =>
+            el.querySelector(sel)?.getAttribute(a) ?? '';
 
-      for (const item of items) {
-        try {
-          const reservation = await this.parseReservationItem(item, propertyId, propertyName, options);
-          if (reservation) {
-            reservations.push(reservation);
-          }
-        } catch (error) {
-          this.logger.warn(`Failed to parse reservation: ${error}`);
-        }
+          return {
+            bookingRef:
+              text('[class*="booking-id"],[data-testid="booking-id"],.booking_id') ||
+              attr('[data-id]', 'data-id') ||
+              el.id ||
+              '',
+            guestName:
+              text('[class*="guest-name"],[data-testid="guest-name"],.guest_name') || '',
+            checkIn:
+              text(
+                '[class*="check-in"],[data-testid="checkin"],.date_from,.arrival,[class*="checkin"]'
+              ) || '',
+            checkOut:
+              text(
+                '[class*="check-out"],[data-testid="checkout"],.date_to,.departure,[class*="checkout"]'
+              ) || '',
+            status:
+              text('[class*="status"],[data-testid="status"],.status') || '',
+            price:
+              text(
+                '[class*="price"],[class*="amount"],[data-testid="price"],.price,.amount'
+              ) || '',
+            currency:
+              el.querySelector('[class*="currency"]')?.textContent?.trim() ?? 'EUR',
+          };
+        });
+
+        if (!data.checkIn && !data.bookingRef) continue;
+        if (!this.filterDateRange(data.checkIn, options.startDate, options.endDate)) continue;
+
+        const nights = this.calculateNights(data.checkIn, data.checkOut);
+        const grossAmount = this.parseAmount(data.price);
+
+        reservations.push({
+          propertyId: hotelId,
+          propertyName: `Booking.com Hotel ${hotelId}`,
+          bookingDate: new Date().toISOString().split('T')[0],
+          checkInDate: data.checkIn,
+          checkOutDate: data.checkOut,
+          nights,
+          guestCount: 1,
+          guestName: data.guestName,
+          bookingReference: data.bookingRef,
+          grossAmount,
+          currency: data.currency,
+          hostFees: 0,
+          platformFees: 0,
+          cleaningFees: 0,
+          touristTax: 0,
+          otherTaxes: 0,
+          netAmount: grossAmount,
+          status: data.status,
+        });
+      } catch (error) {
+        this.logger.warn(`Failed to parse reservation row ${i}: ${error}`);
       }
-    } catch (error) {
-      this.logger.warn(`Could not fetch reservations for property ${propertyId}: ${error}`);
     }
 
     return reservations;
   }
 
-  private async parseReservationItem(
-    item: any,
-    propertyId: string,
-    propertyName: string,
-    options: ExtractionOptions
-  ): Promise<Reservation | null> {
-    const itemData = await item.evaluate((element: Element) => {
-      return {
-        guestName: element.querySelector('[data-testid="guest-name"]')?.textContent?.trim() || '',
-        bookingReference: element.querySelector('[data-testid="booking-ref"]')?.textContent?.trim() || '',
-        checkInDate: element.querySelector('[data-testid="checkin"]')?.textContent?.trim() || '',
-        checkOutDate: element.querySelector('[data-testid="checkout"]')?.textContent?.trim() || '',
-        status: element.querySelector('[data-testid="status"]')?.textContent?.trim() || '',
-        totalAmount: element.querySelector('[data-testid="amount"]')?.textContent?.trim() || '',
-      };
-    });
+  // ---------------------------------------------------------------------------
+  // Payouts / Finance
+  // ---------------------------------------------------------------------------
 
-    // Filter by date range
-    if (!this.filterDateRange(itemData.checkInDate, options.startDate, options.endDate)) {
-      return null;
-    }
+  private async getPayouts(hotelId: string, options: ExtractionOptions): Promise<Payout[]> {
+    if (!this.page) throw new Error('Page not initialized');
 
-    const nights = this.calculateNights(itemData.checkInDate, itemData.checkOutDate);
-    const grossAmount = this.parseAmount(itemData.totalAmount);
+    this.logger.info(`Fetching payouts for hotel ${hotelId}...`);
 
-    const reservation: Reservation = {
-      propertyId,
-      propertyName,
-      bookingDate: new Date().toISOString().split('T')[0],
-      checkInDate: itemData.checkInDate,
-      checkOutDate: itemData.checkOutDate,
-      nights,
-      guestCount: 1,
-      guestName: itemData.guestName,
-      bookingReference: itemData.bookingReference,
-      grossAmount,
-      currency: 'EUR',
-      hostFees: 0,
-      platformFees: 0,
-      cleaningFees: 0,
-      touristTax: 0,
-      otherTaxes: 0,
-      netAmount: grossAmount,
-      status: itemData.status,
-    };
-
-    return reservation;
-  }
-
-  private async getPayouts(options: ExtractionOptions): Promise<Payout[]> {
-    if (!this.page) {
-      throw new Error('Page not initialized');
-    }
-
-    const payouts: Payout[] = [];
-    this.logger.info('Fetching payouts...');
+    const url = `${ADMIN_URL}/hotel/hoteladmin/financial_overview.html?hotel_id=${hotelId}`;
 
     try {
-      await this.navigateTo('https://partner.booking.com/en-gb/finances/payouts');
-      await this.page.waitForSelector('[data-testid="payout-item"]', { timeout: 10000 });
+      await this.page.goto(url, { waitUntil: 'domcontentloaded' });
+      await this.page.waitForLoadState('networkidle').catch(() => {});
+      await this.screenshot(`payouts-${hotelId}`);
+      await this.savePageHtml(`payouts-${hotelId}`);
 
-      const items = await this.page.$$('[data-testid="payout-item"]');
-      this.logger.debug(`Found ${items.length} payout items`);
+      const rowSelectors = [
+        '[data-testid="invoice-row"]',
+        'tr.invoice-row',
+        'tr[data-invoice-id]',
+        'table.invoices tbody tr',
+        '[class*="invoice"] tr',
+        'table tbody tr',
+      ];
 
-      for (const item of items) {
-        try {
-          const payout = await this.parsePayoutItem(item, options);
-          if (payout) {
-            payouts.push(payout);
-          }
-        } catch (error) {
-          this.logger.warn(`Failed to parse payout: ${error}`);
-        }
+      const rowSelector = await this.firstPresentSelector(rowSelectors);
+      if (!rowSelector) {
+        this.logger.warn(
+          `No payout rows found on ${url}. ` +
+            `Inspect payouts-${hotelId}.html in ${this.debugDir} to find the correct selector.`
+        );
+        return [];
       }
+
+      this.logger.debug(`Payout rows matched by: "${rowSelector}"`);
+      return await this.parsePayoutRows(rowSelector, options);
     } catch (error) {
-      this.logger.warn(`Could not fetch payouts: ${error}`);
+      this.logger.warn(`Could not fetch payouts for hotel ${hotelId}: ${error}`);
+      await this.screenshot(`payouts-${hotelId}-error`);
+      return [];
+    }
+  }
+
+  private async parsePayoutRows(selector: string, options: ExtractionOptions): Promise<Payout[]> {
+    if (!this.page) return [];
+
+    const rows = this.page.locator(selector);
+    const count = await rows.count();
+    this.logger.info(`Parsing ${count} payout rows`);
+
+    const payouts: Payout[] = [];
+
+    for (let i = 0; i < count; i++) {
+      try {
+        const row = rows.nth(i);
+
+        const data = await row.evaluate((el: Element) => {
+          const text = (sel: string) =>
+            el.querySelector(sel)?.textContent?.trim() ?? '';
+
+          return {
+            date: text('[class*="date"],.date') || '',
+            amount:
+              text('[class*="amount"],[class*="price"],[class*="total"],.amount') || '',
+            reference:
+              text('[class*="id"],[class*="ref"],[class*="invoice"],.id,.ref') || '',
+            status: text('[class*="status"],.status') || '',
+          };
+        });
+
+        if (!data.date && !data.amount) continue;
+        if (!this.filterDateRange(data.date, options.startDate, options.endDate)) continue;
+
+        payouts.push({
+          payoutDate: data.date,
+          amount: this.parseAmount(data.amount),
+          currency: 'EUR',
+          reference: data.reference,
+          status: data.status,
+        });
+      } catch (error) {
+        this.logger.warn(`Failed to parse payout row ${i}: ${error}`);
+      }
     }
 
     return payouts;
   }
 
-  private async parsePayoutItem(item: any, options: ExtractionOptions): Promise<Payout | null> {
-    const itemData = await item.evaluate((element: Element) => {
-      return {
-        date: element.querySelector('[data-testid="payout-date"]')?.textContent?.trim() || '',
-        amount: element.querySelector('[data-testid="payout-amount"]')?.textContent?.trim() || '',
-        reference: element.querySelector('[data-testid="payout-ref"]')?.textContent?.trim() || '',
-        status: element.querySelector('[data-testid="payout-status"]')?.textContent?.trim() || '',
-      };
-    });
+  // ---------------------------------------------------------------------------
+  // Helpers
+  // ---------------------------------------------------------------------------
 
-    // Filter by date range
-    if (!this.filterDateRange(itemData.date, options.startDate, options.endDate)) {
+  /** Return the first selector from the list that matches at least one element. */
+  private async firstPresentSelector(selectors: string[]): Promise<string | null> {
+    if (!this.page) return null;
+    for (const sel of selectors) {
+      const count = await this.page.locator(sel).count();
+      if (count > 0) return sel;
+    }
+    return null;
+  }
+
+  /** Return the first selector from the list that has a visible element within timeout. */
+  private async firstVisibleSelector(
+    selectors: string[],
+    timeout = 10000
+  ): Promise<string | null> {
+    if (!this.page) return null;
+    const combined = selectors.join(', ');
+    try {
+      await this.page.waitForSelector(combined, { timeout });
+    } catch {
       return null;
     }
+    for (const sel of selectors) {
+      if (await this.page.isVisible(sel)) return sel;
+    }
+    return null;
+  }
 
-    const payout: Payout = {
-      payoutDate: itemData.date,
-      amount: this.parseAmount(itemData.amount),
-      currency: 'EUR',
-      reference: itemData.reference,
-      status: itemData.status,
-    };
+  private async screenshot(name: string): Promise<void> {
+    if (!this.page) return;
+    try {
+      await mkdir(this.debugDir, { recursive: true });
+      const path = join(this.debugDir, `${name}.png`);
+      await this.page.screenshot({ path, fullPage: true });
+      this.logger.debug(`Screenshot: ${path}`);
+    } catch (error) {
+      this.logger.debug(`Screenshot failed: ${error}`);
+    }
+  }
 
-    return payout;
+  private async savePageHtml(name: string): Promise<void> {
+    if (!this.page) return;
+    try {
+      await mkdir(this.debugDir, { recursive: true });
+      const content = await this.page.content();
+      const path = join(this.debugDir, `${name}.html`);
+      await writeFile(path, content, 'utf-8');
+      this.logger.debug(`HTML dump: ${path}`);
+    } catch (error) {
+      this.logger.debug(`HTML dump failed: ${error}`);
+    }
   }
 
   private calculateNights(checkIn: string, checkOut: string): number {
     try {
       const start = new Date(checkIn);
       const end = new Date(checkOut);
-      const diffTime = Math.abs(end.getTime() - start.getTime());
-      return Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+      const diff = end.getTime() - start.getTime();
+      return Math.max(1, Math.round(diff / (1000 * 60 * 60 * 24)));
     } catch {
       return 0;
     }
   }
 
   private parseAmount(amountStr: string): number {
-    const match = amountStr.match(/[\d,]+\.?\d*/);
-    if (match) {
-      return parseFloat(match[0].replace(/,/g, ''));
-    }
-    return 0;
+    if (!amountStr) return 0;
+    // Strip currency symbols, keep digits, comma, dot, minus
+    const cleaned = amountStr.replace(/[^\d.,-]/g, '');
+    // Handle European format: 1.234,56 → 1234.56
+    const normalised = cleaned.replace(/\.(?=\d{3})/g, '').replace(',', '.');
+    return parseFloat(normalised) || 0;
   }
 }
