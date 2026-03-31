@@ -9,8 +9,12 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx src/index.ts",
+    "dev:airbnb": "tsx src/index.ts airbnb",
+    "dev:booking": "tsx src/index.ts booking",
     "build": "tsc",
     "start": "node dist/index.js",
+    "airbnb": "node dist/index.js airbnb",
+    "booking": "node dist/index.js booking",
     "test": "jest",
     "test:watch": "jest --watch"
   },
