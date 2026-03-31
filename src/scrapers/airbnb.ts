@@ -575,11 +575,21 @@ export class AirbnbScraper extends BaseScraper {
       };
     });
 
-    const guestPaidSection = modalData.sections.find((section) => section.title === 'Guest paid');
-    const hostPayoutSection = modalData.sections.find((section) => section.title === 'Host payout');
+    this.logger.debug(`Modal sections found: ${modalData.sections.map((s) => `"${s.title}" (${s.rows.length} rows)`).join(', ')}`);
+
+    const guestPaidSection =
+      modalData.sections.find((section) => /guest\s*paid/i.test(section.title)) ??
+      modalData.sections[0];
+    const hostPayoutSection =
+      modalData.sections.find((section) => /host\s*payout/i.test(section.title)) ??
+      modalData.sections[1];
+
+    this.logger.debug(`Guest paid rows: ${JSON.stringify(guestPaidSection?.rows)}`);
+    this.logger.debug(`Host payout rows: ${JSON.stringify(hostPayoutSection?.rows)}`);
 
     const grossAmount = this.extractSectionTotal(guestPaidSection?.rows || []);
     const guestServiceFee = this.extractSectionAmount(guestPaidSection?.rows || [], 'Guest service fee');
+    const guestPropertyUseTaxes = this.extractSectionAmount(guestPaidSection?.rows || [], 'Property use taxes');
     const netAmount = this.extractSectionTotal(hostPayoutSection?.rows || []);
     const hostServiceFee = Math.abs(
       this.extractSectionAmount(hostPayoutSection?.rows || [], 'Host service fee')
@@ -588,7 +598,7 @@ export class AirbnbScraper extends BaseScraper {
       hostPayoutSection?.rows || [],
       'Nightly rate adjustment'
     );
-    const propertyUseTaxes = this.extractSectionAmount(hostPayoutSection?.rows || [], 'Property use taxes');
+    const hostPropertyUseTaxes = this.extractSectionAmount(hostPayoutSection?.rows || [], 'Property use taxes');
     const cleaningFee = this.extractSectionAmount(hostPayoutSection?.rows || [], 'Cleaning fee');
     const currency =
       this.extractCurrencyCodeFromRows(hostPayoutSection?.rows || []) ||
@@ -603,9 +613,9 @@ export class AirbnbScraper extends BaseScraper {
       hostServiceFee,
       nightlyRateAdjustment,
       hostFees: hostServiceFee,
-      propertyUseTaxes,
+      propertyUseTaxes: hostPropertyUseTaxes,
       cleaningFee,
-      otherTaxes: propertyUseTaxes,
+      otherTaxes: guestPropertyUseTaxes,
       netAmount,
       notes: this.formatSectionNotes(hostPayoutSection?.rows || []),
     };
