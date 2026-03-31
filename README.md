@@ -5,11 +5,8 @@ Node.js 24 LTS CLI for extracting host-side booking and tax data from Airbnb and
 This project is currently optimized around the Airbnb host flow that was validated live against the current UI on March 31, 2026.
 
 Current status:
-- Airbnb extraction is the main working path.
-- Airbnb now reads reservation data from the `Reservation Details` modal, not just the table.
-- Airbnb writes an in-progress CSV while the run is still happening.
-- Airbnb normalizes collapsed UI text in property, listing, guest, and modal payout fields before export.
-- Booking.com remains more experimental and will likely need selector work against a live account.
+- Airbnb extraction is the main working path, validated live on March 31, 2026.
+- Booking.com extraction has been hardened with robust amount/date parsing, 2FA detection, and improved selectors, but still requires live validation against a specific account's UI.
 
 What "working" means right now:
 - the scraper can launch a headed browser on macOS

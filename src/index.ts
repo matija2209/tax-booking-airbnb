@@ -105,12 +105,17 @@ const argv = yargs(hideBin(process.argv))
     async (args) => {
       try {
         const credentials = validateConfig('booking');
+        const exporter = new CsvExporter((args.output as string) || join(__dirname, '..', 'output'), logger);
+        const progressiveReservations: ExtractionOptions['onReservationProcessed'] = async (_reservation, reservations) => {
+          await exporter.exportReservationsProgress(reservations);
+        };
         const options: ExtractionOptions = {
           propertyId: args.propertyId,
           startDate: args.startDate,
           endDate: args.endDate,
           output: args.output as string,
           verbose: args.verbose as boolean | undefined,
+          onReservationProcessed: progressiveReservations,
         };
 
         logger.info('Initializing Booking.com scraper...');
@@ -119,7 +124,6 @@ const argv = yargs(hideBin(process.argv))
 
         logger.info(`Extracted ${result.reservations.length} reservations and ${result.payouts.length} payouts`);
 
-        const exporter = new CsvExporter(options.output!, logger);
         await exporter.export(result);
 
         logger.info('Booking.com extraction completed successfully');

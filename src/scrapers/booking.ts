@@ -3,7 +3,7 @@ import { join } from 'path';
 import { BaseScraper } from './base.js';
 import { Reservation, Payout, ExtractionResult, ExtractionOptions } from '../types/index.js';
 import { calculateAggregates } from '../extractors/aggregates.js';
-import { formatDate } from '../utils/dates.js';
+import { formatDate, parseDate } from '../utils/dates.js';
 
 const ADMIN_URL = 'https://admin.booking.com';
 
@@ -41,6 +41,17 @@ export class BookingScraper extends BaseScraper {
 
       for (const hotelId of idsToScrape) {
         this.logger.info(`Extracting data for hotel ID: ${hotelId}`);
+
+        // Navigate to dashboard first to establish session context
+        const dashboardUrl = `https://admin.booking.com/hotel/hoteladmin/extranet_ng/manage/home.html?hotel_id=${hotelId}`;
+        await this.page.goto(dashboardUrl, { waitUntil: 'domcontentloaded' });
+        await this.page.waitForTimeout(3000);
+
+        if (this.page.url().includes('/sign-in') || this.page.url().includes('/login')) {
+          this.logger.warn('Session lost during dashboard navigation. Attempting re-login...');
+          await this.loginToBooking();
+          await this.page.goto(dashboardUrl, { waitUntil: 'domcontentloaded' });
+        }
 
         const reservations = await this.getReservations(hotelId, options);
         allReservations.push(...reservations);
@@ -93,6 +104,9 @@ export class BookingScraper extends BaseScraper {
     await this.page.fill(loginSelector, this.credentials.email);
     this.logger.debug(`Filled login name using selector: ${loginSelector}`);
 
+    // Check for CAPTCHA/Challenge after entering username
+    await this.checkForCaptcha();
+
     // Booking.com may show password on the same page or require a "Continue" click first
     const passwordSelector = 'input[name="password"], input[type="password"]';
     const passwordVisible = await this.page.isVisible(passwordSelector);
@@ -100,46 +114,204 @@ export class BookingScraper extends BaseScraper {
     if (!passwordVisible) {
       this.logger.debug('Password field not visible yet — clicking submit to reveal it...');
       await this.page.click('button[type="submit"], input[type="submit"]');
+      
+      // Check for CAPTCHA/Challenge after clicking "Next"
+      await this.checkForCaptcha();
+
       try {
         await this.page.waitForSelector(passwordSelector, { timeout: 10000 });
         await this.screenshot('02-password-step');
       } catch {
-        await this.screenshot('02-no-password-field');
-        await this.savePageHtml('02-after-username-submit');
-        throw new Error(
-          'Password field did not appear after username submit. Check debug output.'
-        );
+        // If password selector still not found, check CAPTCHA one more time
+        await this.checkForCaptcha();
+
+        if (await this.page.isVisible(passwordSelector)) {
+           // password might have appeared after CAPTCHA
+        } else {
+          await this.screenshot('02-no-password-field');
+          await this.savePageHtml('02-after-username-submit');
+          throw new Error(
+            'Password field did not appear after username submit. Check debug output.'
+          );
+        }
       }
     }
 
-    await this.page.fill(passwordSelector, this.credentials.password);
-    await this.screenshot('03-before-submit');
-    this.logger.debug('Filled password, submitting...');
+    // Check CAPTCHA right before filling password
+    await this.checkForCaptcha();
 
-    await this.page.click('button[type="submit"], input[type="submit"]');
+    const submitButtons = [
+      'button[type="submit"]',
+      'input[type="submit"]',
+      'button:has-text("Sign in")',
+      'button:has-text("Next")',
+    ];
 
-    // Wait for successful login: URL should change away from login/signin paths
-    try {
-      await this.page.waitForFunction(
-        "!window.location.href.includes('/login') && " +
-          "!window.location.href.includes('/signin') && " +
-          "!window.location.href.includes('login.en-gb')",
-        { timeout: 30000 }
-      );
-      this.logger.info('Login successful');
-    } catch {
-      await this.screenshot('04-login-failed');
-      await this.savePageHtml('04-login-result');
+    let loginResolved = false;
+    let attempts = 0;
+    while (!loginResolved && attempts < 5) {
+      attempts++;
+      
+      // Check/Fill password if visible
+      if (await this.page.isVisible(passwordSelector)) {
+        await this.page.fill(passwordSelector, this.credentials.password);
+        await this.page.waitForTimeout(1000);
+        
+        const submitSelector = await this.firstVisibleSelector(submitButtons);
+        if (submitSelector) {
+          this.logger.debug(`Clicking submit button (attempt ${attempts}): ${submitSelector}`);
+          await this.page.click(submitSelector);
+        } else {
+          await this.page.keyboard.press('Enter');
+        }
+        await this.page.waitForTimeout(5000);
+      }
+
+      await this.checkForCaptcha();
+
       const currentUrl = this.page.url();
-      throw new Error(
-        `Login may have failed — still on login page. Current URL: ${currentUrl}` +
-          `\nCheck credentials in .env and see debug output for details.`
-      );
+      if (!currentUrl.includes('/login') && !currentUrl.includes('/signin') && !currentUrl.includes('/sign-in') && !currentUrl.includes('login.en-gb')) {
+        loginResolved = true;
+        this.logger.info('Login successful');
+      } else {
+        // Still on login page, might need 2FA or another attempt
+        const is2FAVisible = await this.page.evaluate(() => {
+          return !!(
+            document.querySelector('[data-testid*="verification"]') ||
+            document.querySelector('[class*="verification"]') ||
+            document.body.innerText.includes('Verification method')
+          );
+        });
+        
+        if (is2FAVisible) {
+           await this.handle2FA();
+           loginResolved = true; // handle2FA waits for completion
+        }
+      }
     }
+
+    if (!loginResolved) {
+      throw new Error('Failed to resolve login after multiple attempts.');
+    }
+
+    // Save session state
+    await this.browserManager.getContext().storageState({ path: 'state.json' });
+    this.logger.info('Saved session state to state.json');
 
     await this.screenshot('05-after-login');
     await this.savePageHtml('05-after-login');
     this.logger.debug(`Post-login URL: ${this.page.url()}`);
+  }
+
+  private async handle2FA(): Promise<void> {
+    if (!this.page) return;
+    this.logger.info('Two-factor authentication (2FA) detected. Waiting up to 5 minutes for manual resolution...');
+    
+    const startTime = Date.now();
+    const timeout = 300000; // 5 minutes
+
+    while (Date.now() - startTime < timeout) {
+      const currentUrl = this.page.url();
+      const isStillOnSignIn = currentUrl.includes('/login') || 
+                             currentUrl.includes('/signin') || 
+                             currentUrl.includes('/sign-in') || 
+                             currentUrl.includes('login.en-gb');
+
+      if (!isStillOnSignIn) {
+        this.logger.info(`URL changed to ${currentUrl}. 2FA likely resolved.`);
+        return;
+      }
+
+      this.logger.debug(`2FA Browser Ping: URL=${currentUrl.split('?')[0]}`);
+      await this.page.waitForTimeout(5000);
+    }
+    
+    throw new Error('2FA not resolved within 5 minutes.');
+  }
+
+  private async checkForCaptcha(): Promise<void> {
+    if (!this.page) return;
+
+    const captchaSelectors = [
+      '#challenge-form',
+      '#captcha-container',
+      'iframe[src*="challenge"]',
+      'script[src*="challenge.js"]',
+      'div[id*="challenge"]',
+      '#px-captcha',
+      '[data-testid*="captcha"]',
+    ];
+
+    const isChallengeVisible = await this.page.evaluate((selectors) => {
+      const text = document.body.innerText;
+      return selectors.some(s => {
+               const el = document.querySelector(s);
+               if (!el) return false;
+               const rect = el.getBoundingClientRect();
+               return rect.width > 0 && rect.height > 0;
+             }) || 
+             text.includes('Please solve the challenge') ||
+             text.includes('Verify you are human') ||
+             text.includes("Let's make sure you're human");
+    }, captchaSelectors);
+
+    if (isChallengeVisible) {
+      await this.screenshot('01-login-captcha-detected');
+      this.logger.warn('CAPTCHA or Security Challenge detected: "Let\'s make sure you\'re human" or similar.');
+      
+      if (process.env.HEADLESS === 'false') {
+        this.logger.info('Waiting for manual resolution in the browser (timeout: 2m). I will check status every 5s...');
+        
+        const startTime = Date.now();
+        let resolved = false;
+
+        while (Date.now() - startTime < 120000) {
+          const status = await this.page.evaluate((selectors) => {
+            const text = document.body.innerText;
+            const hasCaptcha = selectors.some(s => {
+              const el = document.querySelector(s);
+              if (!el) return false;
+              const rect = el.getBoundingClientRect();
+              return rect.width > 0 && rect.height > 0;
+            });
+            const hasChallengeText = text.includes('Please solve the challenge') || 
+                                    text.includes('Verify you are human') ||
+                                    text.includes("Let's make sure you're human");
+            const hasPassword = !!document.querySelector('input[name="password"], input[type="password"]');
+            const hasUsernameError = !!document.querySelector('#loginname-error') || text.includes('username and password combination you entered doesn\'t match');
+            
+            return {
+              url: window.location.href,
+              isChallenged: (hasCaptcha || hasChallengeText) && !hasPassword,
+              hasPassword,
+              hasUsernameError,
+              textSnippet: text.substring(0, 100).replace(/\n/g, ' ')
+            };
+          }, captchaSelectors);
+
+          if (status.hasPassword) {
+            this.logger.info('Password field detected! Proceeding...');
+            resolved = true;
+            break;
+          }
+
+          if (!status.isChallenged && !status.url.includes('/sign-in')) {
+            this.logger.info(`URL changed to ${status.url}. Challenge likely resolved.`);
+            resolved = true;
+            break;
+          }
+
+          this.logger.debug(`Browser Ping: URL=${status.url.split('?')[0]} | Challenge=${status.isChallenged} | PasswordField=${status.hasPassword}`);
+          await this.page.waitForTimeout(5000);
+        }
+
+        if (!resolved) {
+          this.logger.warn('Timed out waiting for resolution.');
+        }
+      } else {
+        throw new Error('CAPTCHA detected in headless mode. Please run in headed mode to solve.');
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -222,11 +394,20 @@ export class BookingScraper extends BaseScraper {
     const url = `${ADMIN_URL}/hotel/hoteladmin/reservation.en-gb.html?${params}`;
 
     try {
-      await this.page.goto(url, { waitUntil: 'domcontentloaded' });
-      // Give SPA a moment to hydrate
-      await this.page.waitForLoadState('networkidle').catch(() => {});
+      this.logger.debug(`Navigating to reservations: ${url}`);
+      await this.page.goto(url, { waitUntil: 'networkidle' });
+      // Give SPA extra time to settle and avoid being flagged
+      await this.page.waitForTimeout(5000);
+      
       await this.screenshot(`reservations-${hotelId}`);
       await this.savePageHtml(`reservations-${hotelId}`);
+
+      // Check if we got the WAF error page
+      const title = await this.page.title();
+      if (title.includes('request could not be satisfied')) {
+        this.logger.error('WAF Block detected! Direct navigation to reservations failed.');
+        throw new Error('Access blocked by CloudFront/WAF. Try manual navigation first.');
+      }
 
       // Try several plausible row selectors — update once you inspect the real page
       const rowSelectors = [
@@ -286,6 +467,8 @@ export class BookingScraper extends BaseScraper {
               '',
             guestName:
               text('[class*="guest-name"],[data-testid="guest-name"],.guest_name') || '',
+            bookingDate:
+              text('[class*="booking-date"],[data-testid="booking-date"],.booked_on,.date_booked') || '',
             checkIn:
               text(
                 '[class*="check-in"],[data-testid="checkin"],.date_from,.arrival,[class*="checkin"]'
@@ -294,6 +477,8 @@ export class BookingScraper extends BaseScraper {
               text(
                 '[class*="check-out"],[data-testid="checkout"],.date_to,.departure,[class*="checkout"]'
               ) || '',
+            guestCount:
+              text('[class*="guest-count"],[data-testid="guest-count"],.num_guests,.pax,.guest_count') || '',
             status:
               text('[class*="status"],[data-testid="status"],.status') || '',
             price:
@@ -301,7 +486,13 @@ export class BookingScraper extends BaseScraper {
                 '[class*="price"],[class*="amount"],[data-testid="price"],.price,.amount'
               ) || '',
             currency:
-              el.querySelector('[class*="currency"]')?.textContent?.trim() ?? 'EUR',
+              el.querySelector('[class*="currency"]')?.textContent?.trim() ||
+              text('.currency') ||
+              '',
+            commission:
+              text('[class*="commission"],.commission') || '',
+            taxes:
+              text('[class*="tax"],[data-testid="tax"],.tax,.vat') || '',
           };
         });
 
@@ -310,31 +501,40 @@ export class BookingScraper extends BaseScraper {
 
         const nights = this.calculateNights(data.checkIn, data.checkOut);
         const grossAmount = this.parseAmount(data.price);
+        const guestCount = parseInt(data.guestCount.replace(/\D/g, '')) || 1;
+        const hostFees = this.parseAmount(data.commission);
+        const taxes = this.parseAmount(data.taxes);
 
-        reservations.push({
+        const reservation: Reservation = {
           propertyId: hotelId,
           propertyName: `Booking.com Hotel ${hotelId}`,
-          bookingDate: new Date().toISOString().split('T')[0],
+          bookingDate: data.bookingDate || new Date().toISOString().split('T')[0],
           checkInDate: data.checkIn,
           checkOutDate: data.checkOut,
           nights,
-          guestCount: 1,
+          guestCount,
           guestName: data.guestName,
           bookingReference: data.bookingRef,
           grossAmount,
-          currency: data.currency,
+          currency: data.currency || 'EUR',
           guestServiceFee: 0,
-          hostServiceFee: 0,
+          hostServiceFee: hostFees,
           nightlyRateAdjustment: 0,
-          hostFees: 0,
+          hostFees: hostFees,
           platformFees: 0,
-          propertyUseTaxes: 0,
+          propertyUseTaxes: taxes,
           cleaningFees: 0,
           touristTax: 0,
-          otherTaxes: 0,
-          netAmount: grossAmount,
+          otherTaxes: taxes,
+          netAmount: grossAmount - hostFees - taxes,
           status: data.status,
-        });
+        };
+
+        reservations.push(reservation);
+
+        if (options.onReservationProcessed) {
+          await options.onReservationProcessed(reservation, reservations);
+        }
       } catch (error) {
         this.logger.warn(`Failed to parse reservation row ${i}: ${error}`);
       }
@@ -355,10 +555,18 @@ export class BookingScraper extends BaseScraper {
     const url = `${ADMIN_URL}/hotel/hoteladmin/financial_overview.html?hotel_id=${hotelId}`;
 
     try {
-      await this.page.goto(url, { waitUntil: 'domcontentloaded' });
-      await this.page.waitForLoadState('networkidle').catch(() => {});
+      this.logger.debug(`Navigating to payouts: ${url}`);
+      await this.page.goto(url, { waitUntil: 'networkidle' });
+      await this.page.waitForTimeout(5000);
+      
       await this.screenshot(`payouts-${hotelId}`);
       await this.savePageHtml(`payouts-${hotelId}`);
+
+      const title = await this.page.title();
+      if (title.includes('request could not be satisfied')) {
+        this.logger.error('WAF Block detected! Direct navigation to payouts failed.');
+        return [];
+      }
 
       const rowSelectors = [
         '[data-testid="invoice-row"]',
@@ -405,12 +613,12 @@ export class BookingScraper extends BaseScraper {
             el.querySelector(sel)?.textContent?.trim() ?? '';
 
           return {
-            date: text('[class*="date"],.date') || '',
+            date: text('[class*="date"],[data-testid="invoice-date"],.date,.invoice_date') || '',
             amount:
-              text('[class*="amount"],[class*="price"],[class*="total"],.amount') || '',
+              text('[class*="amount"],[class*="price"],[class*="total"],[data-testid="total-amount"],.amount,.total') || '',
             reference:
-              text('[class*="id"],[class*="ref"],[class*="invoice"],.id,.ref') || '',
-            status: text('[class*="status"],.status') || '',
+              text('[class*="id"],[class*="ref"],[class*="invoice"],[data-testid="invoice-id"],.id,.ref,.invoice_number') || '',
+            status: text('[class*="status"],[data-testid="invoice-status"],.status,.invoice_status') || '',
           };
         });
 
@@ -491,9 +699,11 @@ export class BookingScraper extends BaseScraper {
 
   private calculateNights(checkIn: string, checkOut: string): number {
     try {
-      const start = new Date(checkIn);
-      const end = new Date(checkOut);
+      if (!checkIn || !checkOut) return 0;
+      const start = parseDate(checkIn);
+      const end = parseDate(checkOut);
       const diff = end.getTime() - start.getTime();
+      // Ensure we get at least 1 night for valid stays, even if check-in/out are the same (rare)
       return Math.max(1, Math.round(diff / (1000 * 60 * 60 * 24)));
     } catch {
       return 0;
@@ -502,10 +712,28 @@ export class BookingScraper extends BaseScraper {
 
   private parseAmount(amountStr: string): number {
     if (!amountStr) return 0;
-    // Strip currency symbols, keep digits, comma, dot, minus
-    const cleaned = amountStr.replace(/[^\d.,-]/g, '');
-    // Handle European format: 1.234,56 → 1234.56
-    const normalised = cleaned.replace(/\.(?=\d{3})/g, '').replace(',', '.');
+    
+    // Strip currency symbols and other non-numeric chars except digits, comma, dot, and minus
+    const cleaned = amountStr.replace(/[^\d.,-]/g, '').trim();
+    if (!cleaned) return 0;
+
+    // Determine if it's European (1.234,56) or US/UK (1,234.56) format
+    // We look at the last separator
+    const lastComma = cleaned.lastIndexOf(',');
+    const lastDot = cleaned.lastIndexOf('.');
+
+    let normalised = cleaned;
+    if (lastComma > lastDot) {
+      // European format: comma is decimal separator
+      normalised = cleaned.replace(/\./g, '').replace(',', '.');
+    } else if (lastDot > lastComma) {
+      // US/UK format: dot is decimal separator
+      normalised = cleaned.replace(/,/g, '');
+    } else {
+      // No separators or only one type
+      normalised = cleaned.replace(',', '.');
+    }
+
     return parseFloat(normalised) || 0;
   }
 }
