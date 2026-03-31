@@ -5,6 +5,20 @@ All notable changes to the Tax Data Extraction CLI project will be documented in
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-03-17
+
+### Changed
+
+#### Airbnb Scraper — Complete Rewrite (`src/scrapers/airbnb.ts`)
+- Replaced basic login logic with a robust, two-step login flow compatible with Airbnb's live interface
+- Handled the "Continue with email" intermediary step before password entry
+- Pauses the flow automatically when `DEVTOOLS=true` to allow the user to manually solve 2FA challenges
+- Retargeted property extraction to the correct Host Dashboard URL (`/hosting/listings`)
+- Updated property CSS selectors (`tr.tfgampn`, `div.t1ojp9a2`) and ID parsing (`input[id^="checkbox-"]`)
+- Retargeted reservations extraction to the Completed Reservations view (`/hosting/reservations/completed`)
+- Implemented robust pagination logic clicking `button[aria-label="Next"]` (along with localized/SVG fallbacks) until disabled
+- Updated table CSS extraction selectors to fetch Guest Name, Booking Reference, Check-in/Out Dates, Status, and Total Payout Amount from the Host Dashboard table view
+
 ## [1.1.0] - 2026-03-17
 
 ### Changed
