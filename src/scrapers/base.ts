@@ -4,6 +4,7 @@ import { Logger } from '../utils/logger.js';
 import { Credentials } from '../config.js';
 import { parseDate, isDateInRange } from '../utils/dates.js';
 import { ExtractionResult } from '../types/index.js';
+import { existsSync } from 'fs';
 
 export abstract class BaseScraper {
   protected browserManager: BrowserManager;
@@ -45,7 +46,7 @@ export abstract class BaseScraper {
     }
 
     this.logger.debug(`Navigating to ${url}...`);
-    await this.page.goto(url, { waitUntil: 'networkidle' });
+    await this.page.goto(url, { waitUntil: 'domcontentloaded' });
   }
 
   protected filterDateRange(dateString: string, startDate?: string, endDate?: string): boolean {
@@ -63,9 +64,17 @@ export abstract class BaseScraper {
 
   async initialize(): Promise<void> {
     const headless = process.env.HEADLESS !== 'false';
-    this.logger.debug(`Launching browser (headless: ${headless})`);
-    await this.browserManager.launch({ headless });
-    await this.browserManager.createContext();
+    const devtools = process.env.DEVTOOLS === 'true';
+    this.logger.debug(`Launching browser (headless: ${headless}, devtools: ${devtools})`);
+    await this.browserManager.launch({ headless, devtools });
+    
+    let storageState: string | undefined = undefined;
+    if (existsSync('state.json')) {
+      this.logger.debug('Found existing session state file (state.json)');
+      storageState = 'state.json';
+    }
+    
+    await this.browserManager.createContext({ storageState });
     this.page = await this.browserManager.createPage();
   }
 

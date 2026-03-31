@@ -4,6 +4,7 @@ export interface BrowserOptions {
   headless?: boolean;
   timeout?: number;
   slowMo?: number;
+  devtools?: boolean;
 }
 
 export class BrowserManager {
@@ -18,23 +19,27 @@ export class BrowserManager {
 
   async launch(options: BrowserOptions = {}): Promise<Browser> {
     const headless = options.headless !== false;
+    const devtools = options.devtools === true;
     // Add a small slowMo in headed mode so interactions are visible
     const slowMo = options.slowMo ?? (headless ? 0 : 50);
 
     this.browser = await chromium.launch({
       headless,
+      devtools,
       slowMo,
     });
 
     return this.browser;
   }
 
-  async createContext(): Promise<BrowserContext> {
+  async createContext(options: { storageState?: string } = {}): Promise<BrowserContext> {
     if (!this.browser) {
       throw new Error('Browser not launched. Call launch() first.');
     }
 
-    this.context = await this.browser.newContext();
+    this.context = await this.browser.newContext({
+      storageState: options.storageState,
+    });
     this.context.setDefaultTimeout(this.timeout);
 
     return this.context;
@@ -56,6 +61,13 @@ export class BrowserManager {
       throw new Error('Page not created. Call createPage() first.');
     }
     return this.page;
+  }
+
+  getContext(): BrowserContext {
+    if (!this.context) {
+      throw new Error('Context not created. Call createContext() first.');
+    }
+    return this.context;
   }
 
   async cleanup(): Promise<void> {
