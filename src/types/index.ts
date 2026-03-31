@@ -15,8 +15,12 @@ export interface Reservation {
   bookingReference: string;
   grossAmount: number;
   currency: string;
+  guestServiceFee: number;
+  hostServiceFee: number;
+  nightlyRateAdjustment: number;
   hostFees: number;
   platformFees: number;
+  propertyUseTaxes: number;
   cleaningFees: number;
   touristTax: number;
   otherTaxes: number;

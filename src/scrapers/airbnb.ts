@@ -508,9 +508,13 @@ export class AirbnbScraper extends BaseScraper {
       bookingReference: rowData.bookingReference,
       grossAmount,
       currency,
+      guestServiceFee: detailData.guestServiceFee,
+      hostServiceFee: detailData.hostServiceFee,
+      nightlyRateAdjustment: detailData.nightlyRateAdjustment,
       hostFees: detailData.hostFees,
-      platformFees: 0,
-      cleaningFees: 0,
+      platformFees: detailData.guestServiceFee,
+      propertyUseTaxes: detailData.propertyUseTaxes,
+      cleaningFees: detailData.cleaningFee,
       touristTax: 0,
       otherTaxes: detailData.otherTaxes,
       netAmount: detailData.netAmount || fallbackGrossAmount,
@@ -525,7 +529,12 @@ export class AirbnbScraper extends BaseScraper {
     guestCount: number;
     grossAmount: number;
     currency: string;
+    guestServiceFee: number;
+    hostServiceFee: number;
+    nightlyRateAdjustment: number;
     hostFees: number;
+    propertyUseTaxes: number;
+    cleaningFee: number;
     otherTaxes: number;
     netAmount: number;
     notes?: string;
@@ -570,9 +579,17 @@ export class AirbnbScraper extends BaseScraper {
     const hostPayoutSection = modalData.sections.find((section) => section.title === 'Host payout');
 
     const grossAmount = this.extractSectionTotal(guestPaidSection?.rows || []);
+    const guestServiceFee = this.extractSectionAmount(guestPaidSection?.rows || [], 'Guest service fee');
     const netAmount = this.extractSectionTotal(hostPayoutSection?.rows || []);
-    const hostFees = Math.abs(this.extractSectionAmount(hostPayoutSection?.rows || [], 'Host service fee'));
-    const otherTaxes = this.extractSectionAmount(hostPayoutSection?.rows || [], 'Property use taxes');
+    const hostServiceFee = Math.abs(
+      this.extractSectionAmount(hostPayoutSection?.rows || [], 'Host service fee')
+    );
+    const nightlyRateAdjustment = this.extractSectionAmount(
+      hostPayoutSection?.rows || [],
+      'Nightly rate adjustment'
+    );
+    const propertyUseTaxes = this.extractSectionAmount(hostPayoutSection?.rows || [], 'Property use taxes');
+    const cleaningFee = this.extractSectionAmount(hostPayoutSection?.rows || [], 'Cleaning fee');
     const currency =
       this.extractCurrencyCodeFromRows(hostPayoutSection?.rows || []) ||
       this.extractCurrencyCodeFromRows(guestPaidSection?.rows || []) ||
@@ -582,8 +599,13 @@ export class AirbnbScraper extends BaseScraper {
       guestCount: this.parseGuestCount(modalData.modalText),
       grossAmount,
       currency,
-      hostFees,
-      otherTaxes,
+      guestServiceFee,
+      hostServiceFee,
+      nightlyRateAdjustment,
+      hostFees: hostServiceFee,
+      propertyUseTaxes,
+      cleaningFee,
+      otherTaxes: propertyUseTaxes,
       netAmount,
       notes: this.formatSectionNotes(hostPayoutSection?.rows || []),
     };
@@ -622,8 +644,17 @@ export class AirbnbScraper extends BaseScraper {
   }
 
   private extractSectionAmount(rows: Array<{ label: string; amount: string }>, label: string): number {
-    const row = rows.find((entry) => entry.label.toLowerCase().startsWith(label.toLowerCase()));
+    const normalizedTarget = this.normalizeSectionLabel(label);
+    const row = rows.find((entry) => this.normalizeSectionLabel(entry.label).startsWith(normalizedTarget));
     return row ? this.parseAmount(row.amount) : 0;
+  }
+
+  private normalizeSectionLabel(label: string): string {
+    return label
+      .toLowerCase()
+      .replace(/\([^)]*\)/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
 
   private extractCurrencyCodeFromRows(rows: Array<{ label: string; amount: string }>): string {
