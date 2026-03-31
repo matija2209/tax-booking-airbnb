@@ -7,9 +7,10 @@ This project is currently optimized around the Airbnb host flow that was validat
 Current status:
 - Airbnb extraction is the main working path, validated live on March 31, 2026.
 - Booking.com extraction has been significantly improved:
-  - **Reservations:** Now uses nav-based navigation, proper date range handling, and waits for table loading to complete. Successfully navigates to and prepares the Reservations page for data extraction (March 31, 2026).
+  - **Reservations:** Now navigates to Finance > Reservations statement page via nav menu clicks. Successfully accesses the period selector dropdown (native HTML `<select>` with options in `YYYY-MM` format).
+  - **Period Selection:** Selector is correctly identified and accessible. `selectOption()` with proper `YYYY-MM` format works, but page data reload is not yet triggered. Working on dispatching correct change/input events or finding form submission mechanism.
   - **Session stability:** `state.json` is captured after successful 2FA/CAPTCHA completion, reducing re-auth requirements.
-  - **Still in progress:** Row parsing logic is in place but still needs validation against live reservation data to confirm selector accuracy.
+  - **Calendar Widget:** Implemented interactive calendar date selection for older/alternate reservation search flow (can navigate months and select dates), but main Finance path uses the period selector dropdown instead.
 
 What "working" means right now:
 - the scraper can launch a headed browser on macOS
@@ -91,15 +92,14 @@ The Booking.com flow is:
 4. **Iterative Submission:** Re-attempts password submission if security challenges reset the form.
 5. **Session Management:** Saves `state.json` immediately after successful login to minimize re-auth needs.
 6. **Dashboard Priming:** Navigates to the hotel dashboard to establish session context before hitting data-heavy pages.
-7. **Nav-Based Navigation:** Clicks the Reservations nav link instead of forced URL navigation to avoid WAF blocks and maintain proper session state.
-8. **Date Range Form Interaction:**
-   - Clicks on the date input field to open the interactive calendar popover.
-   - Uses calendar navigation buttons to move between months to reach the target month/year.
-   - Clicks on the date number (e.g., 1 for the first of the month) in the calendar table.
-   - Repeats for both "From" and "To" dates (defaults to Jan 1, 2025 – Dec 31, 2025 if not specified).
-   - Clicks the "Show" button to load reservation data.
-9. **Loading State Handling:** Waits for table loading bars to disappear before parsing rows, ensuring data is fully loaded.
-10. **Data Extraction:** Parses reservation rows using `data-heading` attributes for robust cell identification.
+7. **Nav-Based Navigation:** Clicks Finance → Reservations statement from the nav menu instead of forced URL navigation to avoid WAF blocks and maintain proper session state.
+8. **Period Selection (Finance Reservations Page):**
+   - **Element:** Native HTML `<select class="document-selector">` with Vue-generated id (e.g., `v-0-0-1-0-0`).
+   - **Option Values:** Periods are stored as `YYYY-MM` format (e.g., `2025-09`, `2025-08`).
+   - **Current Issue:** `selectOption()` successfully changes the DOM value, but the page does not auto-reload with new data. Manual keyboard navigation (click → ArrowDown → Enter) also does not trigger a reload.
+   - **Status:** Selector is detected and accessible, but triggering the change event / page update is still in progress.
+   - **Next Steps:** May need to dispatch additional events (change, input, or custom Vue/React events) or find a hidden form submission trigger.
+9. **Data Extraction:** Parses reservation rows from the Finance Reservations statement table using generic column indexing (booking ref, guest name, check-in, check-out, nights, guest count, gross amount, fees).
 
 ## Installation
 

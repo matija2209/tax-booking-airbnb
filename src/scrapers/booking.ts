@@ -87,6 +87,22 @@ export class BookingScraper extends BaseScraper {
     await this.page.goto(ADMIN_URL, { waitUntil: 'domcontentloaded' });
     await this.screenshot('01-login-page');
 
+    // Check if already logged in (session state loaded successfully)
+    const isAlreadyLoggedIn = await this.page.evaluate(() => {
+      const url = window.location.href;
+      const isOnLoginPage = url.includes('/login') ||
+                           url.includes('/signin') ||
+                           url.includes('/sign-in') ||
+                           url.includes('login.en-gb');
+      const hasLoginForm = !!document.querySelector('input[name="loginname"], input[name="username"], input[type="email"]');
+      return !isOnLoginPage && !hasLoginForm;
+    });
+
+    if (isAlreadyLoggedIn) {
+      this.logger.info('Already logged in (session state restored from state.json)');
+      return;
+    }
+
     // Booking.com extranet login form uses name="loginname" for the username field
     const loginSelectors = [
       'input[name="loginname"]',
@@ -391,29 +407,48 @@ export class BookingScraper extends BaseScraper {
     this.logger.info(`Fetching reservations for hotel ${hotelId}...`);
 
     try {
-      // Step 1: Click the Reservations nav item
-      this.logger.debug('Clicking Reservations nav item...');
-      const navSelectors = [
-        'a[href*="search_reservations"]',
-        'a.ext-navigation-top-item__link:has-text("Reservations")',
-        'span.ext-navigation-top-item__title-text:has-text("Reservations")',
+      // Step 1: Navigate to Finance > Reservations statement
+      this.logger.debug('Opening Finance nav menu...');
+
+      // Click the Finance nav item to open submenu
+      const financeNavSelector = '[data-nav-tag="finance"] button.ext-navigation-top-item__link';
+      try {
+        await this.page.waitForSelector(financeNavSelector, { timeout: 8000 });
+        await this.page.click(financeNavSelector);
+        await this.page.waitForTimeout(500);
+        this.logger.debug('Finance nav menu opened');
+      } catch {
+        this.logger.warn('Could not open Finance nav menu. Saving page for inspection.');
+        await this.screenshot(`finance-nav-missing-${hotelId}`);
+        await this.savePageHtml(`finance-nav-missing-${hotelId}`);
+        return [];
+      }
+
+      // Click on Reservations statement submenu item
+      this.logger.debug('Clicking Reservations statement submenu item...');
+      const reservationsStatementSelectors = [
+        'a:has-text("Reservations statement")',
+        '[data-nav-tag="finance_reservations"] a',
+        'span:has-text("Reservations statement")',
       ];
 
-      let clicked = false;
-      for (const sel of navSelectors) {
+      let statementClicked = false;
+      for (const sel of reservationsStatementSelectors) {
         try {
-          await this.page.waitForSelector(sel, { timeout: 8000 });
-          await this.page.click(sel);
-          clicked = true;
-          this.logger.debug(`Clicked Reservations nav using: ${sel}`);
-          break;
+          await this.page.waitForSelector(sel, { timeout: 3000 });
+          if (await this.page.isVisible(sel)) {
+            await this.page.click(sel);
+            statementClicked = true;
+            this.logger.debug(`Clicked Reservations statement using: ${sel}`);
+            break;
+          }
         } catch { /* try next */ }
       }
 
-      if (!clicked) {
-        this.logger.warn('Could not click Reservations nav item. Saving page for inspection.');
-        await this.screenshot(`reservations-nav-missing-${hotelId}`);
-        await this.savePageHtml(`reservations-nav-missing-${hotelId}`);
+      if (!statementClicked) {
+        this.logger.warn('Could not click Reservations statement submenu. Saving page for inspection.');
+        await this.screenshot(`reservations-statement-missing-${hotelId}`);
+        await this.savePageHtml(`reservations-statement-missing-${hotelId}`);
         return [];
       }
 
@@ -421,54 +456,86 @@ export class BookingScraper extends BaseScraper {
       await this.page.waitForTimeout(3000);
       this.logger.info(`Reservations page URL: ${this.page.url()}`);
 
-      // Step 2: Fill the date-range form and click Show
-      const dateFrom = options.startDate
-        ? this.toPickerDate(options.startDate)
-        : this.toPickerDate('2025-01-01');
-      const dateTo = options.endDate
-        ? this.toPickerDate(options.endDate)
-        : this.toPickerDate('2025-12-31');
+      // Step 2: Select period from the period selector dropdown
+      this.logger.debug('Selecting period from period selector...');
 
-      this.logger.debug(`Setting date range: ${dateFrom} → ${dateTo}`);
-
-      await this.page.waitForSelector('#date_from', { timeout: 10000 });
-
-      // Clear and fill date_from (triple-click to select all, then type)
-      await this.page.click('#date_from', { clickCount: 3 });
-      await this.page.waitForTimeout(300);
-      await this.page.keyboard.press('Delete');
-      await this.page.waitForTimeout(300);
-      await this.page.fill('#date_from', dateFrom);
-      await this.page.waitForTimeout(500);
-
-      // Clear and fill date_to
-      await this.page.click('#date_to', { clickCount: 3 });
-      await this.page.waitForTimeout(300);
-      await this.page.keyboard.press('Delete');
-      await this.page.waitForTimeout(300);
-      await this.page.fill('#date_to', dateTo);
-      await this.page.waitForTimeout(500);
-
-      // Click the Show button
-      await this.page.click('button:has-text("Show"), input[value="Show"], [type="submit"]:has-text("Show")');
-      this.logger.info('Clicked Show — waiting up to 60s for reservations table to load...');
-
-      // Step 3: Wait for table rows to load (up to 60s)
-      const rowSelector = 'tr.bui-table__row';
       try {
-        await this.page.waitForSelector(rowSelector, { timeout: 60000 });
-        // Wait for loading bars to disappear (data to load)
-        this.logger.debug('Waiting for table data to load (loading bars to disappear)...');
-        await this.page.waitForFunction(
-          () => {
-            const loadingBars = document.querySelectorAll('tr.bui-table__row .loading-bar--animated');
-            return loadingBars.length === 0;
-          },
-          { timeout: 60000 }
-        );
-        this.logger.debug('Table data loaded successfully');
+        // Find the period selector (select.document-selector)
+        const periodSelector = 'select.document-selector';
+        await this.page.waitForSelector(periodSelector, { timeout: 10000 });
+
+        // Determine target month/year
+        const targetDate = options.startDate || '2025-01-01';
+        const [targetYear, targetMonth] = targetDate.split('-');
+        const targetPeriod = `${targetYear}-${targetMonth}`;
+
+        this.logger.debug(`Target period: ${targetPeriod}`);
+
+        // Get all available options from the select
+        const availableOptions = await this.page.evaluate(() => {
+          const select = document.querySelector('select.document-selector');
+          if (!select) return [];
+          const options: string[] = [];
+          select.querySelectorAll('option[value]').forEach((opt) => {
+            const val = opt.getAttribute('value');
+            if (val) options.push(val);
+          });
+          return options;
+        });
+
+        this.logger.debug(`Available periods: ${availableOptions.join(', ')}`);
+
+        // Try to find exact match, otherwise pick the first available
+        let selectedPeriod = availableOptions.find((p) => p === targetPeriod);
+        if (!selectedPeriod) {
+          this.logger.debug(
+            `Exact match for ${targetPeriod} not found. Using most recent available: ${availableOptions[0]}`
+          );
+          selectedPeriod = availableOptions[0];
+        }
+
+        if (!selectedPeriod) {
+          throw new Error('No periods available in selector');
+        }
+
+        // The select element uses YYYY-MM format for values (e.g., "2025-09" not "2025-9")
+        const selectValue = `${targetYear}-${String(targetMonth).padStart(2, '0')}`;
+
+        // Try to select by the actual format used
+        let finalValue = selectValue;
+        if (!availableOptions.includes(selectValue)) {
+          // The value format might be different, use the selectedPeriod which came from available options
+          finalValue = selectedPeriod;
+        }
+
+        this.logger.debug(`Selecting value: ${finalValue}...`);
+
+        // Use selectOption on the native select element
+        await this.page.selectOption(periodSelector, finalValue);
+        this.logger.debug(`Selected: ${finalValue}`);
+
+        // Wait for the page data to update (it should auto-load)
+        await this.page.waitForTimeout(2000);
+
+        this.logger.debug('Period changed, waiting for table data to load...');
+      } catch (error) {
+        this.logger.warn(`Period selection failed: ${error}. Saving page for inspection.`);
+        await this.screenshot(`period-selection-failed-${hotelId}`);
+        await this.savePageHtml(`period-selection-failed-${hotelId}`);
+        return [];
+      }
+
+      // Step 3: Wait for table rows to load
+      const rowSelector = 'tr.b7e718a9ac';  // Table row class from Finance Reservations page
+      try {
+        await this.page.waitForSelector(rowSelector, { timeout: 30000 });
+        this.logger.debug('Table rows detected');
+
+        // Wait a bit for data to fully render
+        await this.page.waitForTimeout(2000);
+        this.logger.debug('Table data ready for parsing');
       } catch {
-        this.logger.warn('Timed out waiting for reservation rows or data to load. Saving page for inspection.');
+        this.logger.warn('Timed out waiting for reservation rows to load. Saving page for inspection.');
         await this.screenshot(`reservations-timeout-${hotelId}`);
         await this.savePageHtml(`reservations-timeout-${hotelId}`);
         return [];
@@ -483,16 +550,6 @@ export class BookingScraper extends BaseScraper {
       await this.screenshot(`reservations-${hotelId}-error`);
       return [];
     }
-  }
-
-  /** Convert YYYY-MM-DD to the "Month DD, YYYY" format the Booking.com datepicker expects. */
-  private toPickerDate(isoDate: string): string {
-    const [year, month, day] = isoDate.split('-').map(Number);
-    const months = [
-      'January','February','March','April','May','June',
-      'July','August','September','October','November','December',
-    ];
-    return `${months[month - 1]} ${day}, ${year}`;
   }
 
   private async parseReservationRows(
@@ -512,41 +569,39 @@ export class BookingScraper extends BaseScraper {
       try {
         const row = rows.nth(i);
 
-        const data = await row.evaluate((el) => ({
-          bookingRef:
-            el.querySelector('[data-heading="Booking number"] span')?.textContent?.trim() ?? '',
-          guestName:
-            el.querySelector('[data-heading="Guest Name"] a span')?.textContent?.trim() ?? '',
-          guestCount:
-            el.querySelector('[data-heading="Guest Name"] .bui-f-font-caption span')?.textContent?.trim() ?? '',
-          bookingDate:
-            el.querySelector('[data-heading="Booked on"] span')?.textContent?.trim() ?? '',
-          checkIn:
-            el.querySelector('[data-heading="Check-in"] span')?.textContent?.trim() ?? '',
-          checkOut:
-            el.querySelector('[data-heading="Check-out"] span')?.textContent?.trim() ?? '',
-          room:
-            el.querySelector('[data-heading="Rooms"]')?.textContent?.trim() ?? '',
-          status:
-            el.querySelector('[data-heading="Status"] .reservation-status__main span')?.textContent?.trim() ?? '',
-          price:
-            el.querySelector('[data-heading="Price"] span')?.textContent?.trim() ?? '',
-          commission:
-            el.querySelector('[data-heading="Commission and charges"] span')?.textContent?.trim() ?? '',
-        }));
+        // Parse Finance Reservations page table structure
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const data: any = await row.evaluate((el: any) => {
+          const tds: any[] = Array.from(el.querySelectorAll('td'));
+          const getCellText = (index: number): string =>
+            tds[index]?.textContent?.trim().replace(/\s+/g, ' ') ?? '';
+
+          return {
+            bookingRef: tds[0]?.querySelector('a')?.textContent?.trim() ?? getCellText(0),
+            guestName: getCellText(1),
+            checkIn: getCellText(2),
+            checkOut: getCellText(3),
+            nights: getCellText(4),
+            guestCount: getCellText(5),
+            grossAmount: getCellText(6),
+            amount2: getCellText(7),
+            amount3: getCellText(8),
+            hostFees: getCellText(9),
+          };
+        });
 
         if (!data.checkIn && !data.bookingRef) continue;
         if (!this.filterDateRange(data.checkIn, options.startDate, options.endDate)) continue;
 
-        const nights = this.calculateNights(data.checkIn, data.checkOut);
-        const grossAmount = this.parseAmount(data.price);
+        const nights = parseInt(data.nights.replace(/\D/g, '')) || 0;
+        const grossAmount = this.parseAmount(data.grossAmount);
         const guestCountNum = parseInt(data.guestCount.replace(/\D/g, '')) || 1;
-        const hostFees = this.parseAmount(data.commission);
+        const hostFees = this.parseAmount(data.hostFees);
 
         const reservation: Reservation = {
           propertyId: hotelId,
           propertyName: `Booking.com Hotel ${hotelId}`,
-          bookingDate: data.bookingDate || new Date().toISOString().split('T')[0],
+          bookingDate: new Date().toISOString().split('T')[0],
           checkInDate: data.checkIn,
           checkOutDate: data.checkOut,
           nights,
@@ -565,7 +620,7 @@ export class BookingScraper extends BaseScraper {
           touristTax: 0,
           otherTaxes: 0,
           netAmount: grossAmount - hostFees,
-          status: data.status,
+          status: 'Stayed',
         };
 
         reservations.push(reservation);
@@ -713,6 +768,165 @@ export class BookingScraper extends BaseScraper {
       if (await this.page.isVisible(sel)) return sel;
     }
     return null;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Calendar Widget Interaction
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Select a date via the interactive calendar widget.
+   * 1. Click the date input to open calendar popover
+   * 2. Navigate to target month if needed
+   * 3. Click the date number in the calendar
+   * 4. Wait for calendar to close
+   */
+  private async selectDateViaCalendar(inputSelector: string, targetDate: string): Promise<void> {
+    if (!this.page) throw new Error('Page not initialized');
+
+    const [year, month, day] = targetDate.split('-').map(Number);
+
+    this.logger.debug(`Opening calendar for ${inputSelector} to select ${targetDate}`);
+
+    // Click the date input to open calendar
+    await this.page.click(inputSelector);
+    await this.page.waitForTimeout(500);
+
+    // Wait for calendar popover to appear
+    try {
+      await this.page.waitForSelector('.bui-calendar__content', { timeout: 5000 });
+      this.logger.debug('Calendar popover opened');
+    } catch {
+      throw new Error(`Calendar popover failed to open for ${inputSelector}`);
+    }
+
+    // Navigate to target month if needed
+    const isTargetMonth = await this.isCalendarMonth(year, month);
+    if (!isTargetMonth) {
+      this.logger.debug(`Calendar not showing target month ${year}-${month}. Navigating...`);
+      await this.navigateCalendarToMonth(year, month);
+    }
+
+    // Click the day in the calendar
+    this.logger.debug(`Clicking day ${day} in calendar`);
+    const dayElement = await this.page.evaluate((dayNum) => {
+      const cells = document.querySelectorAll('.bui-calendar__date:not(.bui-calendar__date--empty)');
+      const cell = Array.from(cells).find((c) => c.textContent?.trim() === String(dayNum));
+      if (!cell) return null;
+      const rect = cell.getBoundingClientRect();
+      return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+    }, day);
+
+    if (!dayElement) {
+      throw new Error(`Could not find day ${day} in calendar for ${targetDate}`);
+    }
+
+    await this.page.mouse.click(dayElement.x, dayElement.y);
+    await this.page.waitForTimeout(300);
+
+    // Wait for calendar to close
+    try {
+      await this.page.waitForSelector('.bui-calendar__content', { state: 'hidden', timeout: 3000 });
+      this.logger.debug(`Calendar closed after selecting ${targetDate}`);
+    } catch {
+      this.logger.warn(`Calendar did not close after selecting ${targetDate}. Proceeding anyway.`);
+    }
+  }
+
+  /**
+   * Navigate the calendar to a target year/month using prev/next buttons.
+   * Evaluates current month and clicks buttons until target is visible.
+   */
+  private async navigateCalendarToMonth(targetYear: number, targetMonth: number): Promise<void> {
+    if (!this.page) throw new Error('Page not initialized');
+
+    const maxAttempts = 24; // Max 24 months to navigate
+    let attempts = 0;
+
+    while (attempts < maxAttempts) {
+      attempts++;
+
+      const isTarget = await this.isCalendarMonth(targetYear, targetMonth);
+      if (isTarget) {
+        this.logger.debug(`Reached target month ${targetYear}-${String(targetMonth).padStart(2, '0')}`);
+        return;
+      }
+
+      // Determine if we need to go forward or backward
+      const currentMonth = await this.page.evaluate(() => {
+        const header = document.querySelector('.bui-calendar__month');
+        if (!header) return null;
+        const text = header.textContent || '';
+        const monthMatch = text.match(/(\w+)\s+(\d{4})/);
+        if (!monthMatch) return null;
+        const months: Record<string, number> = {
+          january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+          july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+        };
+        const monthNum = months[monthMatch[1].toLowerCase()] || 0;
+        const yearNum = parseInt(monthMatch[2]) || 0;
+        return { year: yearNum, month: monthNum };
+      });
+
+      if (!currentMonth) {
+        throw new Error('Could not extract current month from calendar');
+      }
+
+      // Determine navigation direction
+      let goForward = false;
+      if (currentMonth.year < targetYear) {
+        goForward = true;
+      } else if (currentMonth.year === targetYear && currentMonth.month < targetMonth) {
+        goForward = true;
+      }
+
+      // Click appropriate button
+      const buttonSelector = goForward ? '[data-test-id="next-btn"]' : '[data-test-id="prev-btn"]';
+
+      try {
+        await this.page.click(buttonSelector);
+        await this.page.waitForTimeout(300);
+      } catch {
+        throw new Error(`Could not find ${goForward ? 'next' : 'prev'} button in calendar`);
+      }
+
+      this.logger.debug(
+        `Calendar navigation: current=${currentMonth.year}-${String(currentMonth.month).padStart(2, '0')} ` +
+        `target=${targetYear}-${String(targetMonth).padStart(2, '0')} direction=${goForward ? 'forward' : 'backward'}`
+      );
+    }
+
+    throw new Error(`Could not navigate to month ${targetYear}-${String(targetMonth).padStart(2, '0')} after ${maxAttempts} attempts`);
+  }
+
+  /**
+   * Check if the calendar is currently showing the target month/year.
+   * Extracts year/month from calendar header and compares.
+   */
+  private async isCalendarMonth(targetYear: number, targetMonth: number): Promise<boolean> {
+    if (!this.page) return false;
+
+    return await this.page.evaluate(
+      ({ year, month }) => {
+        const header = document.querySelector('.bui-calendar__month');
+        if (!header) return false;
+
+        const text = header.textContent || '';
+        const monthMatch = text.match(/(\w+)\s+(\d{4})/);
+        if (!monthMatch) return false;
+
+        const months: Record<string, number> = {
+          january: 1, february: 2, march: 3, april: 4, may: 5, june: 6,
+          july: 7, august: 8, september: 9, october: 10, november: 11, december: 12,
+        };
+
+        const currentMonth = months[monthMatch[1].toLowerCase()] || 0;
+        const currentYear = parseInt(monthMatch[2]) || 0;
+
+        return currentYear === year && currentMonth === month;
+      },
+      { year: targetYear, month: targetMonth }
+    );
   }
 
   private async screenshot(name: string): Promise<void> {
