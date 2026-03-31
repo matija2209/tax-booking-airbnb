@@ -8,10 +8,12 @@ export class CsvExporter {
   private outputDir: string;
   private logger: Logger;
   private timestamp: string;
+  private platform: string;
 
-  constructor(outputDir: string, logger: Logger) {
+  constructor(outputDir: string, logger: Logger, platform: string = 'airbnb_booking') {
     this.outputDir = outputDir;
     this.logger = logger;
+    this.platform = platform;
     this.timestamp = new Date().toISOString().split('T')[0];
   }
 
@@ -27,7 +29,7 @@ export class CsvExporter {
 
   async exportReservationsProgress(reservations: Reservation[]): Promise<void> {
     await this.ensureOutputDir();
-    const filename = join(this.outputDir, `airbnb_booking_reservations_${this.timestamp}_in_progress.csv`);
+    const filename = join(this.outputDir, `${this.platform}_reservations_${this.timestamp}_in_progress.csv`);
     const writer = this.createReservationWriter(filename);
     await writer.writeRecords(reservations);
     this.logger.debug(`Progress-saved ${reservations.length} reservations to ${filename}`);
@@ -49,7 +51,7 @@ export class CsvExporter {
       return;
     }
 
-    const filename = join(this.outputDir, `airbnb_booking_reservations_${timestamp}.csv`);
+    const filename = join(this.outputDir, `${this.platform}_reservations_${timestamp}.csv`);
 
     const writer = this.createReservationWriter(filename);
 
@@ -92,6 +94,11 @@ export class CsvExporter {
         { id: 'reservationUrl', title: 'Reservation URL' },
         { id: 'result', title: 'Result' },
         { id: 'isDisputed', title: 'Is Disputed' },
+        { id: 'detailedGuestName', title: 'Detailed Guest Name' },
+        { id: 'detailedBookingReference', title: 'Detailed Booking Ref' },
+        { id: 'detailedGrossAmount', title: 'Detailed Gross Amount' },
+        { id: 'detailedHostFees', title: 'Detailed Host Fees' },
+        { id: 'detailedBookingDate', title: 'Detailed Booking Date' },
       ],
     });
   }
@@ -102,7 +109,7 @@ export class CsvExporter {
       return;
     }
 
-    const filename = join(this.outputDir, `airbnb_booking_payouts_${timestamp}.csv`);
+    const filename = join(this.outputDir, `${this.platform}_payouts_${timestamp}.csv`);
 
     const writer = createObjectCsvWriter({
       path: filename,
@@ -130,7 +137,7 @@ export class CsvExporter {
       return;
     }
 
-    const filename = join(this.outputDir, `yearly_aggregates_${timestamp}.csv`);
+    const filename = join(this.outputDir, `${this.platform}_yearly_aggregates_${timestamp}.csv`);
 
     const writer = createObjectCsvWriter({
       path: filename,
@@ -156,6 +163,6 @@ export class CsvExporter {
   }
 }
 
-export const createCsvExporter = (outputDir: string, logger: Logger): CsvExporter => {
-  return new CsvExporter(outputDir, logger);
+export const createCsvExporter = (outputDir: string, logger: Logger, platform?: string): CsvExporter => {
+  return new CsvExporter(outputDir, logger, platform);
 };

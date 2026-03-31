@@ -49,7 +49,7 @@ const argv = yargs(hideBin(process.argv))
     async (args) => {
       try {
         const credentials = validateConfig('airbnb');
-        const exporter = new CsvExporter((args.output as string) || join(__dirname, '..', 'output'), logger);
+        const exporter = new CsvExporter((args.output as string) || join(__dirname, '..', 'output'), logger, 'airbnb');
         const progressiveReservations: ExtractionOptions['onReservationProcessed'] = async (_reservation, reservations) => {
           await exporter.exportReservationsProgress(reservations);
         };
@@ -105,7 +105,7 @@ const argv = yargs(hideBin(process.argv))
     async (args) => {
       try {
         const credentials = validateConfig('booking');
-        const exporter = new CsvExporter((args.output as string) || join(__dirname, '..', 'output'), logger);
+        const exporter = new CsvExporter((args.output as string) || join(__dirname, '..', 'output'), logger, 'booking');
         const progressiveReservations: ExtractionOptions['onReservationProcessed'] = async (_reservation, reservations) => {
           await exporter.exportReservationsProgress(reservations);
         };

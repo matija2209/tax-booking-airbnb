@@ -30,6 +30,13 @@ export interface Reservation {
   reservationUrl?: string;
   result?: string;
   isDisputed?: boolean;
+  
+  // Detailed fields fetched from individual pages
+  detailedGuestName?: string;
+  detailedBookingReference?: string;
+  detailedGrossAmount?: number;
+  detailedHostFees?: number;
+  detailedBookingDate?: string;
 }
 
 export interface Payout {

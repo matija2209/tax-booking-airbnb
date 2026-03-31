@@ -524,6 +524,8 @@ export class BookingScraper extends BaseScraper {
         await this.screenshot(`reservations-${hotelId}-complete`);
         await this.savePageHtml(`reservations-${hotelId}-complete`);
 
+        await this.extractReservationDetails(allReservations);
+
         return allReservations;
       } catch (error) {
         this.logger.warn(`Failed to initialize period loop for hotel ${hotelId}: ${error}`);
@@ -630,6 +632,68 @@ export class BookingScraper extends BaseScraper {
     }
 
     return reservations;
+  }
+
+  private async extractReservationDetails(reservations: Reservation[]): Promise<void> {
+    if (!this.page) return;
+
+    this.logger.info(`Extracting detailed information for ${reservations.length} reservations...`);
+
+    for (let i = 0; i < reservations.length; i++) {
+      const res = reservations[i];
+      if (!res.reservationUrl) continue;
+
+      try {
+        this.logger.debug(`Navigating to reservation details: ${res.reservationUrl}`);
+        await this.page.goto(res.reservationUrl, { waitUntil: 'domcontentloaded' });
+        await this.page.waitForTimeout(3000); // Wait for potential dynamic data
+
+        // Intercept login/2FA redirect and wait
+        const currentUrl = this.page.url();
+        if (currentUrl.includes('/login') || currentUrl.includes('/signin') || currentUrl.includes('verification')) {
+          this.logger.warn('Hit login/2FA intercept on reservation detail page. Waiting up to 5 mins for manual resolution...');
+          const startTime = Date.now();
+          while (Date.now() - startTime < 300000) {
+            if (!this.page.url().includes('login') && !this.page.url().includes('signin') && !this.page.url().includes('verification')) {
+               break;
+            }
+            await this.page.waitForTimeout(5000);
+          }
+          // After 2FA, it usually redirects automatically. Let's just go to the URL again to be safe
+          await this.page.goto(res.reservationUrl, { waitUntil: 'domcontentloaded' });
+          await this.page.waitForTimeout(3000);
+        }
+
+        const guestName = await this.page.textContent('[data-test-id="reservation-overview-name"]').catch(() => null);
+        if (guestName) res.detailedGuestName = guestName.trim();
+
+        const bookingNumber = await this.page.textContent('p.res-content__label:has-text("Booking number:") + p.res-content__info').catch(() => null);
+        if (bookingNumber) res.detailedBookingReference = bookingNumber.trim();
+
+        const totalPriceText = await this.page.textContent('p.res-content__label:has-text("Total price") + p.res-content__info').catch(() => null);
+        if (totalPriceText) {
+          res.detailedGrossAmount = this.parseAmount(totalPriceText);
+        }
+
+        const commissionText = await this.page.textContent('p.res-content__label:has-text("Commission and charges:") + p.res-content__info').catch(() => null);
+        if (commissionText) {
+          res.detailedHostFees = this.parseAmount(commissionText);
+        }
+
+        const receivedText = await this.page.textContent('p.res-content__label:has-text("Received") + p.res-content__info').catch(() => null);
+        if (receivedText) {
+          // Parse date (e.g. "Sunday, April 13, 2025" or "Sun, Apr 13, 2025")
+          try {
+            const dateObj = new Date(receivedText.replace(/^[a-zA-Z]+,\s*/, ''));
+            if (!isNaN(dateObj.getTime())) {
+              res.detailedBookingDate = dateObj.toISOString().split('T')[0];
+            }
+          } catch (e) {}
+        }
+      } catch (error) {
+        this.logger.warn(`Failed to extract details for ${res.bookingReference || 'unknown'}: ${error}`);
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
