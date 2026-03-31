@@ -524,7 +524,7 @@ export class BookingScraper extends BaseScraper {
         await this.screenshot(`reservations-${hotelId}-complete`);
         await this.savePageHtml(`reservations-${hotelId}-complete`);
 
-        await this.extractReservationDetails(allReservations);
+        await this.extractReservationDetails(allReservations, options);
 
         return allReservations;
       } catch (error) {
@@ -634,7 +634,7 @@ export class BookingScraper extends BaseScraper {
     return reservations;
   }
 
-  private async extractReservationDetails(reservations: Reservation[]): Promise<void> {
+  private async extractReservationDetails(reservations: Reservation[], options: ExtractionOptions): Promise<void> {
     if (!this.page) return;
 
     this.logger.info(`Extracting detailed information for ${reservations.length} reservations...`);
@@ -693,6 +693,11 @@ export class BookingScraper extends BaseScraper {
       } catch (error) {
         this.logger.warn(`Failed to extract details for ${res.bookingReference || 'unknown'}: ${error}`);
       }
+
+      if (options.onReservationProcessed) {
+        await options.onReservationProcessed(res, reservations);
+      }
+      this.logger.info(`[${i + 1}/${reservations.length}] Extracted details for ${res.bookingReference || 'unknown'} and saved/updated to CSV`);
     }
   }
 
