@@ -65,8 +65,11 @@ export abstract class BaseScraper {
   async initialize(): Promise<void> {
     const headless = process.env.HEADLESS !== 'false';
     const devtools = process.env.DEVTOOLS === 'true';
-    this.logger.debug(`Launching browser (headless: ${headless}, devtools: ${devtools})`);
-    await this.browserManager.launch({ headless, devtools });
+    const channel = process.env.BROWSER_CHANNEL || (headless ? undefined : 'chrome');
+    this.logger.debug(
+      `Launching browser (headless: ${headless}, devtools: ${devtools}, channel: ${channel || 'default'})`
+    );
+    await this.browserManager.launch({ headless, devtools, channel });
     
     let storageState: string | undefined = undefined;
     if (existsSync('state.json')) {
@@ -79,6 +82,11 @@ export abstract class BaseScraper {
   }
 
   async cleanup(): Promise<void> {
+    if (process.env.KEEP_OPEN === 'true') {
+      this.logger.info('KEEP_OPEN=true set. Skipping browser cleanup for manual inspection.');
+      return;
+    }
+
     await this.browserManager.cleanup();
   }
 

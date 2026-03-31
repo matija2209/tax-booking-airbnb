@@ -5,6 +5,7 @@ export interface BrowserOptions {
   timeout?: number;
   slowMo?: number;
   devtools?: boolean;
+  channel?: string;
 }
 
 export class BrowserManager {
@@ -19,14 +20,14 @@ export class BrowserManager {
 
   async launch(options: BrowserOptions = {}): Promise<Browser> {
     const headless = options.headless !== false;
-    const devtools = options.devtools === true;
     // Add a small slowMo in headed mode so interactions are visible
     const slowMo = options.slowMo ?? (headless ? 0 : 50);
+    const channel = options.channel;
 
     this.browser = await chromium.launch({
       headless,
-      devtools,
       slowMo,
+      channel,
     });
 
     return this.browser;

@@ -7,22 +7,30 @@ import { Logger } from '../utils/logger.js';
 export class CsvExporter {
   private outputDir: string;
   private logger: Logger;
+  private timestamp: string;
 
   constructor(outputDir: string, logger: Logger) {
     this.outputDir = outputDir;
     this.logger = logger;
+    this.timestamp = new Date().toISOString().split('T')[0];
   }
 
   async export(result: ExtractionResult): Promise<void> {
     await this.ensureOutputDir();
 
-    const timestamp = new Date().toISOString().split('T')[0];
-
-    await this.exportReservations(result.reservations, timestamp);
-    await this.exportPayouts(result.payouts, timestamp);
-    await this.exportAggregates(result.aggregates, timestamp);
+    await this.exportReservations(result.reservations, this.timestamp);
+    await this.exportPayouts(result.payouts, this.timestamp);
+    await this.exportAggregates(result.aggregates, this.timestamp);
 
     this.logger.info(`All files exported to ${this.outputDir}`);
+  }
+
+  async exportReservationsProgress(reservations: Reservation[]): Promise<void> {
+    await this.ensureOutputDir();
+    const filename = join(this.outputDir, `airbnb_booking_reservations_${this.timestamp}_in_progress.csv`);
+    const writer = this.createReservationWriter(filename);
+    await writer.writeRecords(reservations);
+    this.logger.debug(`Progress-saved ${reservations.length} reservations to ${filename}`);
   }
 
   private async ensureOutputDir(): Promise<void> {
@@ -43,7 +51,19 @@ export class CsvExporter {
 
     const filename = join(this.outputDir, `airbnb_booking_reservations_${timestamp}.csv`);
 
-    const writer = createObjectCsvWriter({
+    const writer = this.createReservationWriter(filename);
+
+    try {
+      await writer.writeRecords(reservations);
+      this.logger.info(`Exported ${reservations.length} reservations to ${filename}`);
+    } catch (error) {
+      this.logger.error(`Failed to export reservations: ${error}`);
+      throw error;
+    }
+  }
+
+  private createReservationWriter(filename: string) {
+    return createObjectCsvWriter({
       path: filename,
       header: [
         { id: 'propertyId', title: 'Property ID' },
@@ -64,16 +84,9 @@ export class CsvExporter {
         { id: 'otherTaxes', title: 'Other Taxes' },
         { id: 'netAmount', title: 'Net Amount' },
         { id: 'status', title: 'Status' },
+        { id: 'notes', title: 'Notes' },
       ],
     });
-
-    try {
-      await writer.writeRecords(reservations);
-      this.logger.info(`Exported ${reservations.length} reservations to ${filename}`);
-    } catch (error) {
-      this.logger.error(`Failed to export reservations: ${error}`);
-      throw error;
-    }
   }
 
   private async exportPayouts(payouts: Payout[], timestamp: string): Promise<void> {

@@ -1,5 +1,4 @@
 export default {
-  preset: 'ts-jest',
   extensionsToTreatAsEsm: ['.ts'],
   testEnvironment: 'node',
   roots: ['<rootDir>/tests'],
@@ -7,10 +6,8 @@ export default {
   moduleNameMapper: {
     '^(\\.{1,2}/.*)\\.js$': '$1',
   },
-  globals: {
-    'ts-jest': {
-      diagnostics: { ignoreCodes: [151002] },
-    },
+  transform: {
+    '^.+\\.ts$': ['ts-jest', { useESM: true, diagnostics: { ignoreCodes: [151002] } }],
   },
   collectCoverageFrom: [
     'src/**/*.ts',

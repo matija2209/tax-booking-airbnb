@@ -15,7 +15,9 @@ import { dirname } from 'path';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const logger = createLogger({ verbose: process.env.VERBOSE === 'true' });
+const logger = createLogger({
+  verbose: process.env.VERBOSE === 'true' || process.argv.includes('--verbose') || process.argv.includes('-v'),
+});
 
 const argv = yargs(hideBin(process.argv))
   .command(
@@ -47,12 +49,17 @@ const argv = yargs(hideBin(process.argv))
     async (args) => {
       try {
         const credentials = validateConfig('airbnb');
+        const exporter = new CsvExporter((args.output as string) || join(__dirname, '..', 'output'), logger);
+        const progressiveReservations: ExtractionOptions['onReservationProcessed'] = async (_reservation, reservations) => {
+          await exporter.exportReservationsProgress(reservations);
+        };
         const options: ExtractionOptions = {
           propertyId: args.propertyId,
           startDate: args.startDate,
           endDate: args.endDate,
           output: args.output as string,
           verbose: args.verbose as boolean | undefined,
+          onReservationProcessed: progressiveReservations,
         };
 
         logger.info('Initializing Airbnb scraper...');
@@ -60,8 +67,6 @@ const argv = yargs(hideBin(process.argv))
         const result = await scraper.extract(options);
 
         logger.info(`Extracted ${result.reservations.length} reservations and ${result.payouts.length} payouts`);
-
-        const exporter = new CsvExporter(options.output!, logger);
         await exporter.export(result);
 
         logger.info('Airbnb extraction completed successfully');

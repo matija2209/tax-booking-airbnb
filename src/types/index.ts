@@ -57,4 +57,8 @@ export interface ExtractionOptions {
   endDate?: string;
   output?: string;
   verbose?: boolean;
+  onReservationProcessed?: (
+    reservation: Reservation,
+    reservations: Reservation[]
+  ) => Promise<void> | void;
 }

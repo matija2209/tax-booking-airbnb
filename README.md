@@ -1,138 +1,169 @@
 # Tax Data Extraction CLI
 
-A Node.js 24 LTS CLI tool for extracting tax-relevant booking data from Airbnb and Booking.com host accounts. The tool automates the extraction of reservation and payout information, organizes it by property, and exports as CSV files for tax reporting and accounting purposes.
+Node.js 24 LTS CLI for extracting host-side booking and tax data from Airbnb and Booking.com.
 
-## Features
+This project is currently optimized around the Airbnb host flow that was validated live against the current UI on March 31, 2026.
 
-- **Multi-platform support**: Extract data from both Airbnb and Booking.com
-- **Comprehensive data extraction**:
-  - Per-reservation data: booking date, stay dates, nights, guest count, pricing breakdown, fees, taxes, status
-  - Per-payout data: payout date, reference, currency, net amount
-  - Yearly aggregates: gross revenue, tax collected, fees withheld, net payouts
-- **Flexible filtering**:
-  - Date range filtering (--startDate, --endDate)
-  - Single property or all properties
-  - CSV export with timestamp
-- **Secure credential management**: Environment variable based authentication
-- **Detailed logging**: Optional verbose output for debugging
+Current status:
+- Airbnb extraction is the main working path.
+- Airbnb now reads reservation data from the `Reservation Details` modal, not just the table.
+- Airbnb writes an in-progress CSV while the run is still happening.
+- Airbnb normalizes collapsed UI text in property, listing, guest, and modal payout fields before export.
+- Booking.com remains more experimental and will likely need selector work against a live account.
+
+What "working" means right now:
+- the scraper can launch a headed browser on macOS
+- manual Airbnb email-code verification can be completed in the browser
+- the scraper reuses session state from `state.json`
+- reservations are processed from the completed reservations table in stable top-down order
+- detailed reservation data is collected from the modal opened by the row `Details` button
+- progress is written to CSV during the run so partial data is not lost if the session breaks later
+
+## What It Extracts
+
+For Airbnb, the scraper currently pulls:
+- reservation identity from the completed reservations table
+- booking date, check-in, checkout, guest summary, listing name, confirmation code
+- guest-paid totals from the reservation details modal
+- host payout totals and fee/tax lines from the reservation details modal
+- normalized property names and guest names suitable for CSV export
+- yearly aggregates derived from the extracted reservations
+
+The stable reservation key is the confirmation code in the table column next to the price. These codes currently start with `HM...`, and the scraper uses them to track what has already been processed during a run.
+
+The extraction strategy assumes:
+- the confirmation code cell is still present in the reservation table
+- the `Details` action is still exposed as the first button inside the row action cell
+- the modal still contains labeled `Guest paid` and `Host payout` sections
+
+## How Airbnb Works Now
+
+The Airbnb flow is:
+1. Load session from `state.json` if present.
+2. Open `https://www.airbnb.com/hosting/listings` to discover properties.
+3. Open `https://www.airbnb.com/hosting/reservations/completed`.
+4. Snapshot the visible table rows in top-down order.
+5. Process rows sequentially by confirmation code.
+6. Click the first button inside the row action cell (`Details`).
+7. Read the `Reservation Details` modal.
+8. Close the modal and continue to the next reservation.
+9. Save progress to CSV during the run.
+
+Runtime behavior:
+- the scraper snapshots each visible reservations page before processing it
+- reservation rows are keyed by confirmation code, not by raw row index
+- already-processed confirmation codes are tracked in memory to avoid duplicate work within the same run
+- the scraper currently skips the separate Airbnb earnings page because the useful payout data is already available inside each reservation modal
+
+Important detail:
+- The Airbnb table mixes multiple properties together on the same page.
+- The scraper no longer loops property-by-property through the same table.
+- It processes the table once in DOM order and maps each row back to the matching property by listing name.
+- Property names from Airbnb listings are normalized before matching so unit suffixes like `CDA#1` do not collapse into the base listing name.
 
 ## Installation
 
 ```bash
-# Install dependencies
-npm install
-# or
 pnpm install
-
-# Create .env file with credentials
 cp .env.example .env
 ```
 
 ## Configuration
 
-Create a `.env` file in the project root with your credentials:
+Create `.env` in the project root:
 
 ```env
 AIRBNB_EMAIL=your_airbnb_email@example.com
-AIRBNB_PASSWORD=your_airbnb_password
+AIRBNB_PASSWORD="your_airbnb_password"
 BOOKING_EMAIL=your_booking_email@example.com
-BOOKING_PASSWORD=your_booking_password
+BOOKING_PASSWORD="your_booking_password"
+BOOKING_HOTEL_ID=optional_booking_hotel_id
+OUTPUT_DIR=./output
+HEADLESS=false
+DEVTOOLS=false
+KEEP_OPEN=false
+```
+
+Notes:
+- Quote passwords if they contain `#`, spaces, or other special characters.
+- `HEADLESS=false` is strongly recommended for Airbnb when email confirmation or 2FA is involved.
+- `KEEP_OPEN=true` leaves the browser open instead of closing it at cleanup.
+- `DEVTOOLS=true` is useful for selector inspection and manual debugging.
+- `state.json` is created and reused automatically after a successful login session.
+
+Recommended local Airbnb debug setup:
+
+```env
+HEADLESS=false
+KEEP_OPEN=true
+DEVTOOLS=false
 OUTPUT_DIR=./output
 ```
 
 ## Usage
 
-### Extract Airbnb Data
+### Airbnb
 
 ```bash
-# Extract all properties
-npm run dev airbnb
+# normal headed run
+KEEP_OPEN=true HEADLESS=false pnpm exec tsx src/index.ts airbnb --verbose
 
-# Extract with date filtering
-npm run dev airbnb --startDate 2024-01-01 --endDate 2024-12-31
+# date filtering
+pnpm exec tsx src/index.ts airbnb --startDate 2024-01-01 --endDate 2024-12-31 --verbose
 
-# Extract single property
-npm run dev airbnb --propertyId your_property_id
-
-# Custom output directory
-npm run dev airbnb --output ./my_export
-
-# Verbose output
-npm run dev airbnb --verbose
+# custom output directory
+pnpm exec tsx src/index.ts airbnb --output ./my_export --verbose
 ```
 
-### Extract Booking.com Data
+Recommended first real run on a desktop:
 
 ```bash
-# Extract all properties
-npm run dev booking
-
-# Extract with date filtering
-npm run dev booking --startDate 2024-01-01 --endDate 2024-12-31
-
-# Extract single property
-npm run dev booking --propertyId your_property_id
-
-# Custom output directory
-npm run dev booking --output ./my_export
+KEEP_OPEN=true HEADLESS=false pnpm exec tsx src/index.ts airbnb --verbose
 ```
 
-## Build and Run
+Why this command:
+- it keeps the browser visible
+- it leaves the browser open after completion or failure
+- it prints per-step logs so selector problems are easier to spot
+- it writes in-progress CSV output while processing reservations
+
+### Booking.com
 
 ```bash
-# Development (with tsx)
-npm run dev airbnb
-npm run dev booking
-
-# Build to JavaScript
-npm run build
-
-# Run compiled version
-npm start airbnb
-npm start booking
-
-# Run tests
-npm test
-npm run test:watch
+pnpm exec tsx src/index.ts booking --verbose
 ```
 
-## Project Structure
+### Build / test
 
-```
-tax-booking-airbnb/
-├── src/
-│   ├── index.ts                 # CLI entry point
-│   ├── config.ts                # Configuration & env var handling
-│   ├── types/
-│   │   └── index.ts             # TypeScript type definitions
-│   ├── scrapers/
-│   │   ├── base.ts              # Base scraper class
-│   │   ├── airbnb.ts            # Airbnb scraper
-│   │   └── booking.ts           # Booking.com scraper
-│   ├── extractors/
-│   │   └── aggregates.ts        # Yearly aggregate calculations
-│   ├── exporters/
-│   │   └── csv.ts               # CSV export utilities
-│   └── utils/
-│       ├── auth.ts              # Credential management
-│       ├── browser.ts           # Playwright browser setup
-│       ├── dates.ts             # Date parsing & filtering
-│       └── logger.ts            # Logging utilities
-├── tests/
-│   ├── airbnb.test.ts
-│   └── booking.test.ts
-├── .env.example                 # Environment variables template
-├── tsconfig.json                # TypeScript configuration
-├── jest.config.js               # Jest testing configuration
-├── package.json                 # Dependencies and scripts
-└── README.md                    # This file
+```bash
+pnpm run build
+pnpm test
+pnpm start airbnb
 ```
 
-## Type Definitions
+## Output Files
 
-### Reservation
+Airbnb currently writes:
 
-```typescript
+1. `output/airbnb_booking_reservations_YYYY-MM-DD_in_progress.csv`
+Progress file updated during the run after each successfully processed reservation.
+
+2. `output/airbnb_booking_reservations_YYYY-MM-DD.csv`
+Final reservation export written at the end of a successful run.
+
+3. `output/yearly_aggregates_YYYY-MM-DD.csv`
+Aggregates derived from final reservation data.
+
+Optional payout output still exists in the exporter, but Airbnb payout-page scraping is currently skipped because the useful host payout data is already captured from each reservation modal.
+
+Operational detail:
+- the in-progress CSV is a full rewrite of the current in-memory reservation set after each processed reservation
+- this is intentionally conservative and resilience-oriented
+- if the run dies halfway through, the file should still contain everything processed up to the last successful modal scrape
+
+## Reservation Schema
+
+```ts
 interface Reservation {
   propertyId: string;
   propertyName: string;
@@ -152,184 +183,171 @@ interface Reservation {
   otherTaxes: number;
   netAmount: number;
   status: string;
+  notes?: string;
 }
 ```
 
-### Payout
+Notes on current field mapping:
+- `grossAmount` is taken from the modal `Guest paid` section when available, otherwise from the table total.
+- `netAmount` is taken from the modal `Host payout` total.
+- `hostFees` is derived from the modal host service fee line.
+- `otherTaxes` is currently mapped from the modal property use taxes line.
+- `notes` stores structured host payout line items as a comma-separated `label: amount` string.
+- `guestName` is trimmed from the table guest summary and trailing punctuation is removed during export normalization.
+- `propertyName` is taken from the normalized Airbnb listings page result, not directly from the raw reservations table text.
 
-```typescript
-interface Payout {
-  payoutDate: string;
-  amount: number;
-  currency: string;
-  reference: string;
-  status: string;
-}
-```
+Example `Host payout` lines seen in the live Airbnb modal:
+- `3 nights room fee`
+- `Nightly rate adjustment`
+- `Host service fee (3.0% + VAT)`
+- `Property use taxes`
+- `Total (EUR)`
 
-### YearlyAggregate
-
-```typescript
-interface YearlyAggregate {
-  year: number;
-  grossRevenue: number;
-  touristTaxCollected: number;
-  otherTaxesCollected: number;
-  totalFeesWithheld: number;
-  netPayoutsReceived: number;
-  currency: string;
-  reservationCount: number;
-}
-```
-
-## Output Files
-
-The tool generates three CSV files by default:
-
-1. **airbnb_booking_reservations_YYYY-MM-DD.csv**
-   - Contains all reservation details
-   - One row per reservation
-   - Includes pricing breakdown and tax information
-
-2. **airbnb_booking_payouts_YYYY-MM-DD.csv**
-   - Contains all payout records
-   - One row per payout
-   - Includes payout date, amount, and reference
-
-3. **yearly_aggregates_YYYY-MM-DD.csv**
-   - Summary statistics by year
-   - Total revenue, taxes, fees, and payouts
-   - Reservation count per year
-
-## Command Line Options
-
-### Common Options
-
-- `-v, --verbose`: Enable verbose logging output
-- `-h, --help`: Show help information
-
-### Airbnb/Booking Commands
-
-- `-p, --propertyId <id>`: Extract data for a specific property ID
-- `-s, --startDate <date>`: Filter reservations from this date (YYYY-MM-DD)
-- `-e, --endDate <date>`: Filter reservations until this date (YYYY-MM-DD)
-- `-o, --output <path>`: Custom output directory for CSV files
-
-## Error Handling
-
-The tool includes comprehensive error handling for:
-
-- Missing or invalid credentials
-- Network timeouts during scraping
-- Login failures
-- Missing or malformed data
-- File system errors during export
-
-Check the console output for detailed error messages when issues occur.
+Example `notes` value written to CSV:
+- `3 nights room fee: € 234.00, Nightly rate adjustment: −€ 18.72, Host service fee (3.0% + VAT): −€ 7.88, Property use taxes: € 22.50, Total (EUR): € 229.90`
 
 ## Logging
 
-Use the `--verbose` flag to enable detailed debug output:
+Use `--verbose` for debug logs:
 
 ```bash
-npm run dev airbnb --verbose
+pnpm exec tsx src/index.ts airbnb --verbose
 ```
 
 Log levels:
-- `[INFO]` - General information messages
-- `[DEBUG]` - Detailed debug information (verbose only)
-- `[WARN]` - Warning messages
-- `[ERROR]` - Error messages
+- `[INFO]` high-level progress
+- `[DEBUG]` detailed navigation and reservation processing
+- `[WARN]` recoverable scraping issues
+- `[ERROR]` hard failures
 
-## Development
-
-### Prerequisites
-
-- Node.js 24.0.0 or higher
-- npm or pnpm
-
-### Dependencies
-
-- **playwright**: ^1.45.0 - Browser automation
-- **yargs**: ^17.7.2 - CLI argument parsing
-- **dotenv**: ^16.3.1 - Environment variable loading
-- **csv-writer**: ^1.6.0 - CSV file generation
-- **date-fns**: ^3.0.0 - Date parsing and formatting
-- **typescript**: ^5.3.3 - Type safety
-- **jest**: ^29.7.0 - Testing framework
-- **tsx**: ^4.7.0 - TypeScript execution for dev
-
-### Scripts
-
-```bash
-npm run dev           # Run with tsx (development)
-npm run build         # Compile TypeScript to JavaScript
-npm start             # Run compiled JavaScript
-npm test              # Run all tests
-npm run test:watch    # Run tests in watch mode
-```
-
-## Data Privacy & Security
-
-- Credentials are stored locally in `.env` and never transmitted to third parties
-- The tool uses headless browser automation via Playwright
-- All data extraction happens locally on your machine
-- Credentials are masked in log output for security
-
-## Limitations & Notes
-
-- This tool requires valid credentials for the platforms
-- Web scraping may break if platform UI changes significantly
-- Some platforms may have rate limiting; consider spacing out extractions
-- Two-factor authentication may require manual intervention
+Examples of useful debug output:
+- current navigation target
+- number of rows found on the page
+- reservation confirmation code being opened
+- progress CSV saves
+- modal open / modal close steps
+- property count discovered from listings
 
 ## Troubleshooting
 
-### Login Failures
+### Airbnb login requires email code / 2FA
 
-If login fails:
-1. Verify credentials are correct in `.env`
-2. Check if 2FA is enabled (may require manual login)
-3. Ensure you're not being rate-limited
-
-### Missing Data
-
-If some data is not being extracted:
-1. Enable verbose logging: `--verbose`
-2. Check if the data is available on the platform
-3. Verify date filters aren't excluding the data
-
-### File Write Errors
-
-If CSV export fails:
-1. Ensure you have write permissions in the output directory
-2. Check available disk space
-3. Verify the path exists and is valid
-
-## Testing
-
-Run the test suite:
+Run headed:
 
 ```bash
-npm test
-
-# Watch mode for development
-npm run test:watch
+HEADLESS=false KEEP_OPEN=true pnpm exec tsx src/index.ts airbnb --verbose
 ```
 
-## License
+If Airbnb asks for an email code:
+- complete the verification manually in the browser
+- the scraper will continue once the session is valid
+- `state.json` will be reused on future runs
+- if the session becomes stale later, delete `state.json` and run headed again
 
-ISC
+### Browser closes too early
 
-## Future Enhancements
+Use:
 
-Potential improvements for future versions:
+```bash
+KEEP_OPEN=true HEADLESS=false pnpm exec tsx src/index.ts airbnb --verbose
+```
 
-- Database storage option (SQLite, PostgreSQL)
-- Data deduplication and reconciliation
-- PDF report generation
-- Email delivery of reports
-- Scheduled/automated extractions
-- Multi-year aggregation
-- Tax calculation assistance
-- Integration with accounting software
+### Password loads as empty
+
+If your password contains `#`, quote it:
+
+```env
+AIRBNB_PASSWORD="abc#123"
+```
+
+### Rows seem to skip or reorder
+
+The scraper now processes rows from a table snapshot using confirmation code as the stable reservation ID.
+
+If behavior still looks wrong:
+- enable `--verbose`
+- confirm the row still has the confirmation code in column 8
+- confirm the action button is still the first `button` inside the row `td`
+- confirm the modal opens from the current visible row, not from a recycled row after table re-render
+- inspect whether Airbnb changed the table markup or virtualized the row list
+
+### A new run attaches to the previous one
+
+If you start multiple Airbnb runs in parallel, Chrome pages and scraper state can collide.
+
+Before rerunning:
+- stop any previous `airbnb` scraper process
+- close old headed Chrome windows started by the scraper
+- rerun only one Airbnb process at a time
+
+### No properties found
+
+This usually means one of:
+- session state is stale
+- Airbnb changed the listings page DOM
+- the page had not fully hydrated
+
+Delete `state.json` and run headed again if needed.
+
+## Limitations
+
+- Airbnb selectors are tightly coupled to the current host UI and may drift.
+- The Airbnb modal parser is working from current live observations, not a fully generalized schema.
+- Progress CSV rewrites the full in-memory reservation set after each processed reservation; this is intentional for resilience, not efficiency.
+- Booking.com is not yet hardened to the same level as Airbnb.
+- Tests currently verify wiring and build stability, not full end-to-end browser extraction.
+- `state.json` contains real authenticated session state and should be treated as sensitive local data.
+- The scraper still depends on manual intervention when Airbnb presents a fresh email challenge or other anti-bot verification.
+- If Airbnb changes the reservation modal labels, amount extraction will need to be updated.
+
+## Practical Workflow
+
+For a real Airbnb extraction session, the most reliable workflow is:
+1. Start headed with `KEEP_OPEN=true`.
+2. Complete any Airbnb login or email-code challenge manually.
+3. Let the scraper process the completed reservations table in order.
+4. Watch the in-progress CSV appear in `output/`.
+5. If the run fails, inspect the last processed confirmation code in the CSV and logs before restarting.
+
+This project is currently designed as a pragmatic extraction tool, not as a polished unattended production service. The live Airbnb UI changes enough that headed debugging is still part of normal operation.
+
+## Project Structure
+
+```text
+tax-booking-airbnb/
+├── src/
+│   ├── index.ts
+│   ├── config.ts
+│   ├── types/index.ts
+│   ├── scrapers/
+│   │   ├── base.ts
+│   │   ├── airbnb.ts
+│   │   └── booking.ts
+│   ├── extractors/aggregates.ts
+│   ├── exporters/csv.ts
+│   └── utils/
+│       ├── browser.ts
+│       ├── dates.ts
+│       └── logger.ts
+├── tests/
+├── .env.example
+├── package.json
+└── README.md
+```
+
+## Scripts
+
+```bash
+pnpm exec tsx src/index.ts airbnb --verbose
+pnpm exec tsx src/index.ts booking --verbose
+pnpm run build
+pnpm test
+```
+
+## Next Improvements
+
+- write payouts incrementally if Booking.com stabilizes
+- add a resume file keyed by confirmation code across separate runs
+- export one JSON debug artifact per processed reservation
+- improve Airbnb modal parsing for hidden / expandable sections
+- add true end-to-end tests against saved HTML fixtures
