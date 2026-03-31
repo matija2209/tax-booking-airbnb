@@ -176,8 +176,12 @@ interface Reservation {
   bookingReference: string;
   grossAmount: number;
   currency: string;
+  guestServiceFee: number;
+  hostServiceFee: number;
+  nightlyRateAdjustment: number;
   hostFees: number;
   platformFees: number;
+  propertyUseTaxes: number;
   cleaningFees: number;
   touristTax: number;
   otherTaxes: number;
@@ -190,8 +194,14 @@ interface Reservation {
 Notes on current field mapping:
 - `grossAmount` is taken from the modal `Guest paid` section when available, otherwise from the table total.
 - `netAmount` is taken from the modal `Host payout` total.
-- `hostFees` is derived from the modal host service fee line.
-- `otherTaxes` is currently mapped from the modal property use taxes line.
+- `guestServiceFee` is derived from the modal guest service fee line using normalized label matching.
+- `hostServiceFee` is derived from the modal host service fee line using normalized label matching.
+- `nightlyRateAdjustment` is derived from the modal nightly rate adjustment line.
+- `propertyUseTaxes` is derived from the modal property use taxes line.
+- `cleaningFees` is derived from the modal cleaning fee line when present.
+- `hostFees` is kept as a backward-compatible alias of `hostServiceFee`.
+- `platformFees` is kept as a backward-compatible alias of `guestServiceFee`.
+- `otherTaxes` is kept as a backward-compatible alias of `propertyUseTaxes`.
 - `notes` stores structured host payout line items as a comma-separated `label: amount` string.
 - `guestName` is trimmed from the table guest summary and trailing punctuation is removed during export normalization.
 - `propertyName` is taken from the normalized Airbnb listings page result, not directly from the raw reservations table text.
