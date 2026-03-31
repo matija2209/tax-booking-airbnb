@@ -28,6 +28,7 @@ export class BrowserManager {
       headless,
       slowMo,
       channel,
+      args: ['--remote-debugging-port=9222'],
     });
 
     return this.browser;

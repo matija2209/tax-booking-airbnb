@@ -464,12 +464,9 @@ export class BookingScraper extends BaseScraper {
         const periodSelector = 'select.document-selector';
         await this.page.waitForSelector(periodSelector, { timeout: 10000 });
 
-        // Determine target month/year
+        // Determine target year
         const targetDate = options.startDate || '2025-01-01';
-        const [targetYear, targetMonth] = targetDate.split('-');
-        const targetPeriod = `${targetYear}-${targetMonth}`;
-
-        this.logger.debug(`Target period: ${targetPeriod}`);
+        const targetYear = targetDate.split('-')[0];
 
         // Get all available options from the select
         const availableOptions = await this.page.evaluate(() => {
@@ -485,66 +482,53 @@ export class BookingScraper extends BaseScraper {
 
         this.logger.debug(`Available periods: ${availableOptions.join(', ')}`);
 
-        // Try to find exact match, otherwise pick the first available
-        let selectedPeriod = availableOptions.find((p) => p === targetPeriod);
-        if (!selectedPeriod) {
-          this.logger.debug(
-            `Exact match for ${targetPeriod} not found. Using most recent available: ${availableOptions[0]}`
-          );
-          selectedPeriod = availableOptions[0];
+        // Filter for all periods in targetYear
+        const periodsToScrape = availableOptions.filter((p) => p.startsWith(`${targetYear}-`));
+        if (periodsToScrape.length === 0) {
+          throw new Error(`No periods available in selector for year ${targetYear}`);
         }
 
-        if (!selectedPeriod) {
-          throw new Error('No periods available in selector');
+        const allReservations: Reservation[] = [];
+        const rowSelector = 'table tbody tr';  // Use more robust table row selector
+
+        for (const period of periodsToScrape) {
+          this.logger.info(`Processing period: ${period}...`);
+          try {
+            await this.page.evaluate((val) => {
+              const s = document.querySelector('select.document-selector') as HTMLSelectElement;
+              if (s) {
+                s.value = val;
+                s.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+            }, period);
+            
+            // Wait for the page data to update (it should auto-load)
+            await this.page.waitForTimeout(3000);
+            
+            try {
+              await this.page.waitForSelector(rowSelector, { timeout: 15000 });
+              // Wait a bit for data to fully render
+              await this.page.waitForTimeout(2000);
+            } catch {
+              this.logger.warn(`Timed out waiting for reservation rows to load for ${period}. Continuing...`);
+              continue; // Move to the next period instead of aborting
+            }
+
+            const periodReservations = await this.parseReservationRows(rowSelector, hotelId, options, allReservations);
+            this.logger.info(`Extracted ${periodReservations.length} new reservations from ${period}`);
+          } catch (err) {
+            this.logger.warn(`Failed to process period ${period}: ${err}`);
+          }
         }
 
-        // The select element uses YYYY-MM format for values (e.g., "2025-09" not "2025-9")
-        const selectValue = `${targetYear}-${String(targetMonth).padStart(2, '0')}`;
+        await this.screenshot(`reservations-${hotelId}-complete`);
+        await this.savePageHtml(`reservations-${hotelId}-complete`);
 
-        // Try to select by the actual format used
-        let finalValue = selectValue;
-        if (!availableOptions.includes(selectValue)) {
-          // The value format might be different, use the selectedPeriod which came from available options
-          finalValue = selectedPeriod;
-        }
-
-        this.logger.debug(`Selecting value: ${finalValue}...`);
-
-        // Use selectOption on the native select element
-        await this.page.selectOption(periodSelector, finalValue);
-        this.logger.debug(`Selected: ${finalValue}`);
-
-        // Wait for the page data to update (it should auto-load)
-        await this.page.waitForTimeout(2000);
-
-        this.logger.debug('Period changed, waiting for table data to load...');
+        return allReservations;
       } catch (error) {
-        this.logger.warn(`Period selection failed: ${error}. Saving page for inspection.`);
-        await this.screenshot(`period-selection-failed-${hotelId}`);
-        await this.savePageHtml(`period-selection-failed-${hotelId}`);
+        this.logger.warn(`Failed to initialize period loop for hotel ${hotelId}: ${error}`);
         return [];
       }
-
-      // Step 3: Wait for table rows to load
-      const rowSelector = 'tr.b7e718a9ac';  // Table row class from Finance Reservations page
-      try {
-        await this.page.waitForSelector(rowSelector, { timeout: 30000 });
-        this.logger.debug('Table rows detected');
-
-        // Wait a bit for data to fully render
-        await this.page.waitForTimeout(2000);
-        this.logger.debug('Table data ready for parsing');
-      } catch {
-        this.logger.warn('Timed out waiting for reservation rows to load. Saving page for inspection.');
-        await this.screenshot(`reservations-timeout-${hotelId}`);
-        await this.savePageHtml(`reservations-timeout-${hotelId}`);
-        return [];
-      }
-
-      await this.screenshot(`reservations-${hotelId}`);
-      await this.savePageHtml(`reservations-${hotelId}`);
-
-      return await this.parseReservationRows(rowSelector, hotelId, options);
     } catch (error) {
       this.logger.warn(`Could not fetch reservations for hotel ${hotelId}: ${error}`);
       await this.screenshot(`reservations-${hotelId}-error`);
@@ -555,7 +539,8 @@ export class BookingScraper extends BaseScraper {
   private async parseReservationRows(
     selector: string,
     hotelId: string,
-    options: ExtractionOptions
+    options: ExtractionOptions,
+    accumulatedReservations?: Reservation[]
   ): Promise<Reservation[]> {
     if (!this.page) return [];
 
@@ -572,21 +557,26 @@ export class BookingScraper extends BaseScraper {
         // Parse Finance Reservations page table structure
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const data: any = await row.evaluate((el: any) => {
-          const tds: any[] = Array.from(el.querySelectorAll('td'));
-          const getCellText = (index: number): string =>
-            tds[index]?.textContent?.trim().replace(/\s+/g, ' ') ?? '';
+          const tds = el.querySelectorAll('td');
+          const texts = [];
+          for (let j = 0; j < 10; j++) {
+            const td = tds[j];
+            texts[j] = td && td.textContent ? td.textContent.trim().replace(/\s+/g, ' ') : '';
+          }
 
+          const aTag = tds[0] ? tds[0].querySelector('a') : null;
           return {
-            bookingRef: tds[0]?.querySelector('a')?.textContent?.trim() ?? getCellText(0),
-            guestName: getCellText(1),
-            checkIn: getCellText(2),
-            checkOut: getCellText(3),
-            nights: getCellText(4),
-            guestCount: getCellText(5),
-            grossAmount: getCellText(6),
-            amount2: getCellText(7),
-            amount3: getCellText(8),
-            hostFees: getCellText(9),
+            bookingRef: aTag && aTag.textContent ? aTag.textContent.trim() : texts[0],
+            reservationUrl: aTag ? aTag.href : undefined,
+            guestName: texts[1],
+            checkIn: texts[2],
+            checkOut: texts[3],
+            result: texts[4],
+            grossAmount: texts[5],
+            hostFees: texts[6],
+            isDisputed: tds[7] ? !!tds[7].querySelector('input[type="checkbox"]:checked') : false,
+            nights: '',
+            guestCount: '',
           };
         });
 
@@ -620,13 +610,19 @@ export class BookingScraper extends BaseScraper {
           touristTax: 0,
           otherTaxes: 0,
           netAmount: grossAmount - hostFees,
-          status: 'Stayed',
+          status: data.result || 'Stayed',
+          reservationUrl: data.reservationUrl,
+          result: data.result,
+          isDisputed: data.isDisputed,
         };
 
         reservations.push(reservation);
+        if (accumulatedReservations) {
+          accumulatedReservations.push(reservation);
+        }
 
         if (options.onReservationProcessed) {
-          await options.onReservationProcessed(reservation, reservations);
+          await options.onReservationProcessed(reservation, accumulatedReservations || reservations);
         }
       } catch (error) {
         this.logger.warn(`Failed to parse reservation row ${i}: ${error}`);

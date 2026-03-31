@@ -27,6 +27,9 @@ export interface Reservation {
   netAmount: number;
   status: string;
   notes?: string;
+  reservationUrl?: string;
+  result?: string;
+  isDisputed?: boolean;
 }
 
 export interface Payout {

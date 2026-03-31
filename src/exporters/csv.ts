@@ -89,6 +89,9 @@ export class CsvExporter {
         { id: 'netAmount', title: 'Net Amount' },
         { id: 'status', title: 'Status' },
         { id: 'notes', title: 'Notes' },
+        { id: 'reservationUrl', title: 'Reservation URL' },
+        { id: 'result', title: 'Result' },
+        { id: 'isDisputed', title: 'Is Disputed' },
       ],
     });
   }
