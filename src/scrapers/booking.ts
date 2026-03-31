@@ -43,6 +43,7 @@ export class BookingScraper extends BaseScraper {
         this.logger.info(`Extracting data for hotel ID: ${hotelId}`);
 
         // Navigate to dashboard first to establish session context
+        if (!this.page) throw new Error('Page not initialized');
         const dashboardUrl = `https://admin.booking.com/hotel/hoteladmin/extranet_ng/manage/home.html?hotel_id=${hotelId}`;
         await this.page.goto(dashboardUrl, { waitUntil: 'domcontentloaded' });
         await this.page.waitForTimeout(3000);
@@ -50,14 +51,16 @@ export class BookingScraper extends BaseScraper {
         if (this.page.url().includes('/sign-in') || this.page.url().includes('/login')) {
           this.logger.warn('Session lost during dashboard navigation. Attempting re-login...');
           await this.loginToBooking();
+          if (!this.page) throw new Error('Page not initialized after re-login');
           await this.page.goto(dashboardUrl, { waitUntil: 'domcontentloaded' });
         }
 
         const reservations = await this.getReservations(hotelId, options);
         allReservations.push(...reservations);
 
-        const payouts = await this.getPayouts(hotelId, options);
-        allPayouts.push(...payouts);
+        // Payouts extraction skipped for now - focus on Reservations
+        // const payouts = await this.getPayouts(hotelId, options);
+        // allPayouts.push(...payouts);
       }
 
       const aggregates = calculateAggregates(allReservations);
@@ -387,53 +390,109 @@ export class BookingScraper extends BaseScraper {
 
     this.logger.info(`Fetching reservations for hotel ${hotelId}...`);
 
-    const params = new URLSearchParams({ hotel_id: hotelId });
-    if (options.startDate) params.set('date_from', options.startDate);
-    if (options.endDate) params.set('date_to', options.endDate);
-
-    const url = `${ADMIN_URL}/hotel/hoteladmin/reservation.en-gb.html?${params}`;
-
     try {
-      this.logger.debug(`Navigating to reservations: ${url}`);
-      await this.page.goto(url, { waitUntil: 'networkidle' });
-      // Give SPA extra time to settle and avoid being flagged
-      await this.page.waitForTimeout(5000);
-      
-      await this.screenshot(`reservations-${hotelId}`);
-      await this.savePageHtml(`reservations-${hotelId}`);
-
-      // Check if we got the WAF error page
-      const title = await this.page.title();
-      if (title.includes('request could not be satisfied')) {
-        this.logger.error('WAF Block detected! Direct navigation to reservations failed.');
-        throw new Error('Access blocked by CloudFront/WAF. Try manual navigation first.');
-      }
-
-      // Try several plausible row selectors — update once you inspect the real page
-      const rowSelectors = [
-        '[data-testid="reservation-row"]',
-        'tr[data-id]',
-        'tr.reservation-row',
-        '.bui-table__row[class*="reservation"]',
-        'table tbody tr',
+      // Step 1: Click the Reservations nav item
+      this.logger.debug('Clicking Reservations nav item...');
+      const navSelectors = [
+        'a[href*="search_reservations"]',
+        'a.ext-navigation-top-item__link:has-text("Reservations")',
+        'span.ext-navigation-top-item__title-text:has-text("Reservations")',
       ];
 
-      const rowSelector = await this.firstPresentSelector(rowSelectors);
-      if (!rowSelector) {
-        this.logger.warn(
-          `No reservation rows found on ${url}. ` +
-            `Inspect reservations-${hotelId}.html in ${this.debugDir} to find the correct selector.`
-        );
+      let clicked = false;
+      for (const sel of navSelectors) {
+        try {
+          await this.page.waitForSelector(sel, { timeout: 8000 });
+          await this.page.click(sel);
+          clicked = true;
+          this.logger.debug(`Clicked Reservations nav using: ${sel}`);
+          break;
+        } catch { /* try next */ }
+      }
+
+      if (!clicked) {
+        this.logger.warn('Could not click Reservations nav item. Saving page for inspection.');
+        await this.screenshot(`reservations-nav-missing-${hotelId}`);
+        await this.savePageHtml(`reservations-nav-missing-${hotelId}`);
         return [];
       }
 
-      this.logger.debug(`Reservation rows matched by: "${rowSelector}"`);
+      await this.page.waitForLoadState('domcontentloaded');
+      await this.page.waitForTimeout(3000);
+      this.logger.info(`Reservations page URL: ${this.page.url()}`);
+
+      // Step 2: Fill the date-range form and click Show
+      const dateFrom = options.startDate
+        ? this.toPickerDate(options.startDate)
+        : this.toPickerDate('2025-01-01');
+      const dateTo = options.endDate
+        ? this.toPickerDate(options.endDate)
+        : this.toPickerDate('2025-12-31');
+
+      this.logger.debug(`Setting date range: ${dateFrom} → ${dateTo}`);
+
+      await this.page.waitForSelector('#date_from', { timeout: 10000 });
+
+      // Clear and fill date_from (triple-click to select all, then type)
+      await this.page.click('#date_from', { clickCount: 3 });
+      await this.page.waitForTimeout(300);
+      await this.page.keyboard.press('Delete');
+      await this.page.waitForTimeout(300);
+      await this.page.fill('#date_from', dateFrom);
+      await this.page.waitForTimeout(500);
+
+      // Clear and fill date_to
+      await this.page.click('#date_to', { clickCount: 3 });
+      await this.page.waitForTimeout(300);
+      await this.page.keyboard.press('Delete');
+      await this.page.waitForTimeout(300);
+      await this.page.fill('#date_to', dateTo);
+      await this.page.waitForTimeout(500);
+
+      // Click the Show button
+      await this.page.click('button:has-text("Show"), input[value="Show"], [type="submit"]:has-text("Show")');
+      this.logger.info('Clicked Show — waiting up to 60s for reservations table to load...');
+
+      // Step 3: Wait for table rows to load (up to 60s)
+      const rowSelector = 'tr.bui-table__row';
+      try {
+        await this.page.waitForSelector(rowSelector, { timeout: 60000 });
+        // Wait for loading bars to disappear (data to load)
+        this.logger.debug('Waiting for table data to load (loading bars to disappear)...');
+        await this.page.waitForFunction(
+          () => {
+            const loadingBars = document.querySelectorAll('tr.bui-table__row .loading-bar--animated');
+            return loadingBars.length === 0;
+          },
+          { timeout: 60000 }
+        );
+        this.logger.debug('Table data loaded successfully');
+      } catch {
+        this.logger.warn('Timed out waiting for reservation rows or data to load. Saving page for inspection.');
+        await this.screenshot(`reservations-timeout-${hotelId}`);
+        await this.savePageHtml(`reservations-timeout-${hotelId}`);
+        return [];
+      }
+
+      await this.screenshot(`reservations-${hotelId}`);
+      await this.savePageHtml(`reservations-${hotelId}`);
+
       return await this.parseReservationRows(rowSelector, hotelId, options);
     } catch (error) {
       this.logger.warn(`Could not fetch reservations for hotel ${hotelId}: ${error}`);
       await this.screenshot(`reservations-${hotelId}-error`);
       return [];
     }
+  }
+
+  /** Convert YYYY-MM-DD to the "Month DD, YYYY" format the Booking.com datepicker expects. */
+  private toPickerDate(isoDate: string): string {
+    const [year, month, day] = isoDate.split('-').map(Number);
+    const months = [
+      'January','February','March','April','May','June',
+      'July','August','September','October','November','December',
+    ];
+    return `${months[month - 1]} ${day}, ${year}`;
   }
 
   private async parseReservationRows(
@@ -453,57 +512,36 @@ export class BookingScraper extends BaseScraper {
       try {
         const row = rows.nth(i);
 
-        const data = await row.evaluate((el: Element) => {
-          const text = (sel: string) =>
-            el.querySelector(sel)?.textContent?.trim() ?? '';
-          const attr = (sel: string, a: string) =>
-            el.querySelector(sel)?.getAttribute(a) ?? '';
-
-          return {
-            bookingRef:
-              text('[class*="booking-id"],[data-testid="booking-id"],.booking_id') ||
-              attr('[data-id]', 'data-id') ||
-              el.id ||
-              '',
-            guestName:
-              text('[class*="guest-name"],[data-testid="guest-name"],.guest_name') || '',
-            bookingDate:
-              text('[class*="booking-date"],[data-testid="booking-date"],.booked_on,.date_booked') || '',
-            checkIn:
-              text(
-                '[class*="check-in"],[data-testid="checkin"],.date_from,.arrival,[class*="checkin"]'
-              ) || '',
-            checkOut:
-              text(
-                '[class*="check-out"],[data-testid="checkout"],.date_to,.departure,[class*="checkout"]'
-              ) || '',
-            guestCount:
-              text('[class*="guest-count"],[data-testid="guest-count"],.num_guests,.pax,.guest_count') || '',
-            status:
-              text('[class*="status"],[data-testid="status"],.status') || '',
-            price:
-              text(
-                '[class*="price"],[class*="amount"],[data-testid="price"],.price,.amount'
-              ) || '',
-            currency:
-              el.querySelector('[class*="currency"]')?.textContent?.trim() ||
-              text('.currency') ||
-              '',
-            commission:
-              text('[class*="commission"],.commission') || '',
-            taxes:
-              text('[class*="tax"],[data-testid="tax"],.tax,.vat') || '',
-          };
-        });
+        const data = await row.evaluate((el) => ({
+          bookingRef:
+            el.querySelector('[data-heading="Booking number"] span')?.textContent?.trim() ?? '',
+          guestName:
+            el.querySelector('[data-heading="Guest Name"] a span')?.textContent?.trim() ?? '',
+          guestCount:
+            el.querySelector('[data-heading="Guest Name"] .bui-f-font-caption span')?.textContent?.trim() ?? '',
+          bookingDate:
+            el.querySelector('[data-heading="Booked on"] span')?.textContent?.trim() ?? '',
+          checkIn:
+            el.querySelector('[data-heading="Check-in"] span')?.textContent?.trim() ?? '',
+          checkOut:
+            el.querySelector('[data-heading="Check-out"] span')?.textContent?.trim() ?? '',
+          room:
+            el.querySelector('[data-heading="Rooms"]')?.textContent?.trim() ?? '',
+          status:
+            el.querySelector('[data-heading="Status"] .reservation-status__main span')?.textContent?.trim() ?? '',
+          price:
+            el.querySelector('[data-heading="Price"] span')?.textContent?.trim() ?? '',
+          commission:
+            el.querySelector('[data-heading="Commission and charges"] span')?.textContent?.trim() ?? '',
+        }));
 
         if (!data.checkIn && !data.bookingRef) continue;
         if (!this.filterDateRange(data.checkIn, options.startDate, options.endDate)) continue;
 
         const nights = this.calculateNights(data.checkIn, data.checkOut);
         const grossAmount = this.parseAmount(data.price);
-        const guestCount = parseInt(data.guestCount.replace(/\D/g, '')) || 1;
+        const guestCountNum = parseInt(data.guestCount.replace(/\D/g, '')) || 1;
         const hostFees = this.parseAmount(data.commission);
-        const taxes = this.parseAmount(data.taxes);
 
         const reservation: Reservation = {
           propertyId: hotelId,
@@ -512,21 +550,21 @@ export class BookingScraper extends BaseScraper {
           checkInDate: data.checkIn,
           checkOutDate: data.checkOut,
           nights,
-          guestCount,
+          guestCount: guestCountNum,
           guestName: data.guestName,
           bookingReference: data.bookingRef,
           grossAmount,
-          currency: data.currency || 'EUR',
+          currency: 'EUR',
           guestServiceFee: 0,
           hostServiceFee: hostFees,
           nightlyRateAdjustment: 0,
           hostFees: hostFees,
           platformFees: 0,
-          propertyUseTaxes: taxes,
+          propertyUseTaxes: 0,
           cleaningFees: 0,
           touristTax: 0,
-          otherTaxes: taxes,
-          netAmount: grossAmount - hostFees - taxes,
+          otherTaxes: 0,
+          netAmount: grossAmount - hostFees,
           status: data.status,
         };
 
@@ -552,41 +590,49 @@ export class BookingScraper extends BaseScraper {
 
     this.logger.info(`Fetching payouts for hotel ${hotelId}...`);
 
-    const url = `${ADMIN_URL}/hotel/hoteladmin/financial_overview.html?hotel_id=${hotelId}`;
-
     try {
-      this.logger.debug(`Navigating to payouts: ${url}`);
-      await this.page.goto(url, { waitUntil: 'networkidle' });
-      await this.page.waitForTimeout(5000);
-      
-      await this.screenshot(`payouts-${hotelId}`);
-      await this.savePageHtml(`payouts-${hotelId}`);
+      // Click the Finance nav item
+      this.logger.debug('Clicking Finance nav item...');
+      const navSelectors = [
+        'a[href*="financial_overview"]',
+        'a.ext-navigation-top-item__link:has-text("Finance")',
+        'span.ext-navigation-top-item__title-text:has-text("Finance")',
+      ];
 
-      const title = await this.page.title();
-      if (title.includes('request could not be satisfied')) {
-        this.logger.error('WAF Block detected! Direct navigation to payouts failed.');
+      let clicked = false;
+      for (const sel of navSelectors) {
+        try {
+          await this.page.waitForSelector(sel, { timeout: 8000 });
+          await this.page.click(sel);
+          clicked = true;
+          this.logger.debug(`Clicked Finance nav using: ${sel}`);
+          break;
+        } catch { /* try next */ }
+      }
+
+      if (!clicked) {
+        this.logger.warn('Could not click Finance nav item. Skipping payouts.');
         return [];
       }
 
-      const rowSelectors = [
-        '[data-testid="invoice-row"]',
-        'tr.invoice-row',
-        'tr[data-invoice-id]',
-        'table.invoices tbody tr',
-        '[class*="invoice"] tr',
-        'table tbody tr',
-      ];
+      await this.page.waitForLoadState('domcontentloaded');
+      await this.page.waitForTimeout(3000);
+      this.logger.info(`Payouts page URL: ${this.page.url()}`);
 
-      const rowSelector = await this.firstPresentSelector(rowSelectors);
-      if (!rowSelector) {
+      await this.screenshot(`payouts-${hotelId}`);
+      await this.savePageHtml(`payouts-${hotelId}`);
+
+      // Look for invoice/payout table rows
+      const rowSelector = 'tr.bui-table__row';
+      const hasRows = await this.page.locator(rowSelector).count();
+      if (hasRows === 0) {
         this.logger.warn(
-          `No payout rows found on ${url}. ` +
-            `Inspect payouts-${hotelId}.html in ${this.debugDir} to find the correct selector.`
+          `No payout rows found. Inspect payouts-${hotelId}.html in ${this.debugDir} to find the correct selector.`
         );
         return [];
       }
 
-      this.logger.debug(`Payout rows matched by: "${rowSelector}"`);
+      this.logger.debug(`Found ${hasRows} payout rows`);
       return await this.parsePayoutRows(rowSelector, options);
     } catch (error) {
       this.logger.warn(`Could not fetch payouts for hotel ${hotelId}: ${error}`);
@@ -608,19 +654,16 @@ export class BookingScraper extends BaseScraper {
       try {
         const row = rows.nth(i);
 
-        const data = await row.evaluate((el: Element) => {
-          const text = (sel: string) =>
-            el.querySelector(sel)?.textContent?.trim() ?? '';
-
-          return {
-            date: text('[class*="date"],[data-testid="invoice-date"],.date,.invoice_date') || '',
-            amount:
-              text('[class*="amount"],[class*="price"],[class*="total"],[data-testid="total-amount"],.amount,.total') || '',
-            reference:
-              text('[class*="id"],[class*="ref"],[class*="invoice"],[data-testid="invoice-id"],.id,.ref,.invoice_number') || '',
-            status: text('[class*="status"],[data-testid="invoice-status"],.status,.invoice_status') || '',
-          };
-        });
+        const data = await row.evaluate((el) => ({
+          date:
+            el.querySelector('[class*="date"],[data-testid="invoice-date"],.date,.invoice_date')?.textContent?.trim() ?? '',
+          amount:
+            el.querySelector('[class*="amount"],[class*="price"],[class*="total"],[data-testid="total-amount"],.amount,.total')?.textContent?.trim() ?? '',
+          reference:
+            el.querySelector('[class*="id"],[class*="ref"],[class*="invoice"],[data-testid="invoice-id"],.id,.ref,.invoice_number')?.textContent?.trim() ?? '',
+          status:
+            el.querySelector('[class*="status"],[data-testid="invoice-status"],.status,.invoice_status')?.textContent?.trim() ?? '',
+        }));
 
         if (!data.date && !data.amount) continue;
         if (!this.filterDateRange(data.date, options.startDate, options.endDate)) continue;
